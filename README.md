@@ -63,7 +63,7 @@ cp .env.example .env
 | 變數 | 說明 |
 | --- | --- |
 | `RAP_API_KEY` | 國網 RAP 平台 API Key |
-| `RAP_BASE_URL` | RAP 端點（預設 `https://rap.genai.nchc.org.tw/api/v1`），任何相容 OpenAI SDK 的端點皆可 |
+| `RAP_BASE_URL` | RAP 端點（預設 `https://portal.genai.nchc.org.tw/api/v1`），任何相容 OpenAI SDK 的端點皆可 |
 | `RAP_MODEL_NAME` | 模型名稱，例如 `Meta-Llama-3-70B-Instruct`、`Taiwan-LLM` |
 | `GITHUB_TOKEN` | GitHub Personal Access Token（需有目標私有倉庫的讀取權限；若啟用快取，還需對 `CACHE_REPO` 有寫入權限） |
 | `GITHUB_REPO` | 目標倉庫，格式 `owner/repo` |

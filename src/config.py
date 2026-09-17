@@ -42,7 +42,7 @@ class ConfigError(Exception):
 
 # --- RAP (國網 RAP 平台，相容 OpenAI SDK) ---
 RAP_API_KEY: str = os.getenv("RAP_API_KEY", "")
-RAP_BASE_URL: str = os.getenv("RAP_BASE_URL", "https://rap.genai.nchc.org.tw/api/v1")
+RAP_BASE_URL: str = os.getenv("RAP_BASE_URL", "https://portal.genai.nchc.org.tw/api/v1")
 RAP_MODEL_NAME: str = os.getenv("RAP_MODEL_NAME", "Meta-Llama-3-70B-Instruct")
 
 # --- GitHub ---
