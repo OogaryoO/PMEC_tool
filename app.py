@@ -16,7 +16,8 @@ from src.config import ConfigError
 from src.github_extractor import GitHubExtractorError
 from src.rag_engine import RAGAnswer, RAGEngine, RAGEngineError
 from src.summarizer import SummarizerError
-from src.sync_pipeline import run_sync
+from src.card_cache import CardCacheError
+from src.sync_pipeline import bootstrap_from_cache, run_sync
 from src.vector_store import VectorStore, VectorStoreError
 
 st.set_page_config(
@@ -110,6 +111,43 @@ def run_sync_pipeline(vector_store: VectorStore) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Auto-bootstrap: 冷啟動時本地向量資料庫是空的，但 GitHub 快取可能已有先前累積的
+# 卡片；自動從快取還原，不呼叫 GitHub extractor、不呼叫 RAP LLM，讓使用者一進入
+# 頁面就能直接提問，不必手動點擊「同步並更新」並等待完整流程。
+# ---------------------------------------------------------------------------
+if "cache_bootstrap_attempted" not in st.session_state:
+    st.session_state.cache_bootstrap_attempted = False
+if "cache_bootstrap_warning" not in st.session_state:
+    st.session_state.cache_bootstrap_warning = None
+
+if not st.session_state.cache_bootstrap_attempted:
+    _bootstrap_vs, _bootstrap_vs_error = try_get_vector_store()
+    if not _bootstrap_vs_error:
+        try:
+            if _bootstrap_vs.count() == 0:
+                st.session_state.cache_bootstrap_attempted = True
+                with st.spinner("首次載入：從 GitHub 功能卡片快取還原知識庫中 ..."):
+                    _result = bootstrap_from_cache(_bootstrap_vs)
+                if _result:
+                    st.session_state.last_sync_info = {
+                        "time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "doc_count": _result.card_count,
+                        "reused_count": _result.card_count,
+                        "new_count": 0,
+                        "failed_count": 0,
+                        "total_in_db": _result.total_in_db,
+                        "cache_used": True,
+                    }
+            else:
+                st.session_state.cache_bootstrap_attempted = True
+        except VectorStoreError:
+            pass  # 交由下方 Sidebar 區塊統一顯示向量資料庫錯誤
+        except CardCacheError as exc:
+            st.session_state.cache_bootstrap_attempted = True
+            st.session_state.cache_bootstrap_warning = str(exc)
+
+
+# ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
 with st.sidebar:
@@ -122,6 +160,12 @@ with st.sidebar:
         st.markdown(f"**功能卡片快取**：`{config.CACHE_REPO}` / `{config.CACHE_FILE_PATH}`")
     else:
         st.markdown("**功能卡片快取**：未啟用（每次同步都會重新呼叫 RAP LLM 摘要）")
+
+    if st.session_state.get("cache_bootstrap_warning"):
+        st.caption(
+            f"⚠️ 自動從快取還原知識庫失敗：{st.session_state.cache_bootstrap_warning}"
+            "（可手動點擊下方「同步並更新」建立知識庫）"
+        )
 
     github_missing = config.validate(require_github=True, require_rap=False)
     rap_missing = config.validate(require_github=False, require_rap=True)

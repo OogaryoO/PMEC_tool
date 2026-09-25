@@ -59,6 +59,11 @@ CACHE_ENABLED: bool = os.getenv("CACHE_ENABLED", "true").strip().lower() in ("1"
 CACHE_REPO: str = os.getenv("CACHE_REPO", "")
 CACHE_FILE_PATH: str = os.getenv("CACHE_FILE_PATH", "pmec_cache/feature_cards.json")
 CACHE_BRANCH: str = os.getenv("CACHE_BRANCH", "")  # 空字串 = 該 repo 的預設分支
+# 讀寫 CACHE_REPO 用的 token。刻意獨立於 GITHUB_TOKEN：GITHUB_TOKEN 只需對
+# GITHUB_REPO（V2 商業邏輯來源）有唯讀權限，但快取需要對 CACHE_REPO 有寫入權限；
+# 兩者權限範圍不同，不應共用同一把 token。留空則 fallback 回 GITHUB_TOKEN
+# （相容舊設定，但代表 GITHUB_TOKEN 需同時具備兩邊權限）。
+CACHE_GITHUB_TOKEN: str = os.getenv("CACHE_GITHUB_TOKEN", "") or GITHUB_TOKEN
 
 # --- 其他可調參數 ---
 PR_FETCH_LIMIT: int = int(os.getenv("PR_FETCH_LIMIT", "20"))

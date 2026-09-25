@@ -87,14 +87,21 @@ streamlit run app.py
 啟動後：
 
 1. 於側邊欄確認「GitHub 設定」與「RAP LLM 設定」皆顯示綠色（設定完整）。
-2. 點擊「🔄 同步並更新 GitHub 知識庫」：依序執行
+2. **首次載入自動還原**：若本地 ChromaDB 是空的（例如剛部署、或 ephemeral
+   檔案系統重啟後 `chroma_data/` 被清空），且 `CACHE_REPO` 已設定且上面已有
+   快取內容，頁面載入時會自動從 `CACHE_REPO` 讀取快取並還原向量資料庫——
+   不會呼叫 `github_extractor`、也不會呼叫 RAP LLM，通常數秒內完成，不需要
+   手動點擊任何按鈕即可直接提問。若快取是空的或未設定 `CACHE_REPO`，則維持
+   原本流程，需手動點擊「同步並更新」。
+3. 點擊「🔄 同步並更新 GitHub 知識庫」：依序執行
    `github_extractor` 抓取 → 比對 `card_cache` → 未快取的部分交給 `summarizer`
    用 RAP LLM 轉譯功能卡片 → `vector_store` 寫入 ChromaDB → 更新後的快取寫回
-   `CACHE_REPO`。
-3. 於主畫面聊天輸入框，輸入商務問題，例如：
+   `CACHE_REPO`。用於手動抓取 GitHub 上「新」的內容（新 PR、README/API 規格
+   有變動）；本地知識庫已還原時不需要每次都點擊。
+4. 於主畫面聊天輸入框，輸入商務問題，例如：
    - 「我們的系統有支援 CSV 批量匯入名單嗎？」
    - 「我們能不能承諾客戶支援即時推送？」
-4. 系統會回傳四段式結構化分析：
+5. 系統會回傳四段式結構化分析：
    - 【能否承諾客戶】：可以 / 有條件可以 / 目前無法
    - 【現況支援程度】：非技術語言說明
    - 【差距與風險（Gap Analysis）】：規格落差與技術限制
@@ -107,7 +114,7 @@ streamlit run app.py
 - **RAP 連線失敗**：確認 `RAP_BASE_URL`、`RAP_API_KEY`、`RAP_MODEL_NAME` 是否正確，以及網路是否可連到 RAP 端點。
 - **同步後知識庫仍為 0 筆**：可能該倉庫沒有 README、常見路徑找不到 API 規格檔，或近期沒有已合併的 PR；可調整 `src/github_extractor.py` 中的候選路徑清單。
 - **重複同步會不會產生重複資料？** 不會，`vector_store.py` 依內容雜湊產生穩定 ID，採 upsert 策略覆蓋既有卡片。
-- **Streamlit Community Cloud 重啟後知識庫會不會消失？** ChromaDB 本身會消失（ephemeral 檔案系統），但只要有設定 `CACHE_REPO`，`sync_pipeline` 會用 GitHub 上的功能卡片快取免費（不呼叫 RAP）重建整個向量資料庫；只有真正「新的」PR 或內容變更過的 README/API 規格才會重新呼叫 RAP LLM。
+- **Streamlit Community Cloud 重啟後知識庫會不會消失？** ChromaDB 本身會消失（ephemeral 檔案系統），但只要有設定 `CACHE_REPO` 且上面已有快取內容，頁面一載入就會自動偵測到本地資料庫是空的並從快取還原（不呼叫 `github_extractor`、不呼叫 RAP，數秒內完成），不需要手動點擊「同步並更新」。想抓取「新的」PR 或有變動的 README/API 規格，才需要手動點擊該按鈕——這時只有真正新增/變動的文件會重新呼叫 RAP LLM。
 - **未設定 `CACHE_REPO` 會怎樣？** 功能正常，只是每次同步都會對所有抓到的文件重新呼叫 RAP LLM 摘要，等同放棄額度節省。
 
 ## 授權

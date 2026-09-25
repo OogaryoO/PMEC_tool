@@ -72,7 +72,7 @@ def run_sync(vector_store: VectorStore, progress: Optional[ProgressFn] = None) -
             card_cache = CardCache(
                 repo_full_name=config.CACHE_REPO,
                 file_path=config.CACHE_FILE_PATH,
-                token=config.GITHUB_TOKEN,
+                token=config.CACHE_GITHUB_TOKEN,
                 branch=config.CACHE_BRANCH,
             )
             cache = card_cache.load()
@@ -139,3 +139,37 @@ def run_sync(vector_store: VectorStore, progress: Optional[ProgressFn] = None) -
         cache_used=cache_used and card_cache is not None,
         cache_warning=cache_warning,
     )
+
+
+@dataclass
+class BootstrapResult:
+    card_count: int
+    total_in_db: int
+
+
+def bootstrap_from_cache(vector_store: VectorStore) -> Optional[BootstrapResult]:
+    """僅用 GitHub 上既有的功能卡片快取還原本地 ChromaDB，不呼叫 GitHubExtractor、
+    不呼叫 RAP LLM。用於 App 冷啟動時本地向量資料庫是空的（ephemeral 檔案系統重建
+    或首次啟動），但 GitHub 上已有先前累積的快取，讓使用者一進入頁面就能直接提問，
+    不必手動點擊「同步並更新」並等待完整流程。
+
+    快取未啟用、未設定 CACHE_REPO、或快取內容目前是空的，回傳 None（呼叫端應提示
+    使用者改用「同步並更新」建立知識庫）。讀取快取失敗時拋出 CardCacheError。
+    """
+    if not (config.CACHE_ENABLED and config.CACHE_REPO):
+        return None
+
+    card_cache = CardCache(
+        repo_full_name=config.CACHE_REPO,
+        file_path=config.CACHE_FILE_PATH,
+        token=config.CACHE_GITHUB_TOKEN,
+        branch=config.CACHE_BRANCH,
+    )
+    cache = card_cache.load()
+    if not cache:
+        return None
+
+    all_cards = [FeatureCard(**fields) for fields in cache.values()]
+    vector_store.upsert_cards(all_cards)
+    total_in_db = vector_store.count()
+    return BootstrapResult(card_count=len(all_cards), total_in_db=total_in_db)
