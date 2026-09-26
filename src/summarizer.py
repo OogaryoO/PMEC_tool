@@ -19,6 +19,7 @@ import openai
 from openai import OpenAI
 
 from src import config
+from src.chunker import source_ref_of
 from src.documents import ExtractedDocument
 
 logger = config.get_logger(__name__)
@@ -225,11 +226,7 @@ class Summarizer:
         else:
             key_points = [str(p) for p in key_points_raw]
 
-        source_ref = ""
-        if doc.doc_type in ("pr", "gdrive"):
-            source_ref = str(doc.metadata.get("url") or (doc.files[0] if doc.files else ""))
-        elif doc.files:
-            source_ref = doc.files[0]
+        source_ref = source_ref_of(doc)
 
         return FeatureCard(
             feature_name=feature_name,

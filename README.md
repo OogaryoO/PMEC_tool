@@ -1,8 +1,9 @@
-# PMEC Tool — PM ↔ GitHub 商務對齊助理
+# PMEC Tool — 知識庫助理
 
-內部工具，銜接 PM 的商務語言與 GitHub 實作成果。透過 RAG 架構，把工程團隊的
-README / API 規格 / 已合併 PR，以及（選填）Google Drive 指定資料夾內的組織文件，
-轉譯成 PM 看得懂的「功能卡片」，並在 PM 提問時產出結構化、可直接對外溝通的分析回答。
+內部知識庫工具。透過 RAG 架構，把工程團隊的 README / API 規格 / 已合併 PR，
+以及（選填）Google Drive 指定資料夾內的組織文件，轉譯成知識卡片；使用者提問時，
+助理先判斷問題意圖（事實查詢、進度狀態、操作說明、彙整比較、對客戶承諾評估、閒聊），
+再依意圖產生回答並標註引用來源。
 
 ## 架構
 
@@ -18,10 +19,11 @@ project-root/
 │   ├── github_extractor.py   # 透過 PyGithub 抓取 README、API 規格、近期 Merged PR
 │   ├── gdrive_extractor.py   # 透過 Google Drive API（Service Account）讀取指定資料夾（含子資料夾）文件
 │   ├── card_cache.py         # 把摘要過的功能卡片寫回 GitHub repo 當快取，避免重複消耗 RAP 額度
-│   ├── summarizer.py         # 呼叫 RAP LLM 將 Raw Code/PR 轉譯為商業功能卡片
-│   ├── vector_store.py       # ChromaDB + 內建免費 ONNX Embedding，建立與檢索向量資料庫
-│   ├── sync_pipeline.py      # 串接 extractor → 快取 → summarizer → vector_store 的同步協調器
-│   └── rag_engine.py         # 接收 PM 需求，檢索實作，產出結構化商務對齊回答
+│   ├── summarizer.py         # 呼叫 RAP LLM 將 Raw Code/PR/文件轉譯為功能卡片（文件概要）
+│   ├── chunker.py            # 把文件原文切成段落（試算表逐列保留欄名），供細節檢索
+│   ├── vector_store.py       # ChromaDB + 本地多語 ONNX Embedding（fastembed），存放卡片與原文段落
+│   ├── sync_pipeline.py      # 串接 extractor → 快取 → summarizer / chunker → vector_store 的同步協調器
+│   └── rag_engine.py         # 接收提問（含先前對話），檢索卡片與原文段落，依問題意圖產生回答
 ├── scripts/
 │   ├── check_rap_connection.py     # 手動驗證 RAP LLM 連線
 │   └── check_gdrive_connection.py  # 手動驗證 Google Drive 金鑰與資料夾權限
@@ -41,9 +43,12 @@ flowchart LR
     C -->|RAP LLM 轉譯| D
     D -->|寫回快取| Z
     D -->|Embedding + Upsert| E[(ChromaDB)]
-    F[PM 提問] --> G[rag_engine]
+    B --> CH[chunker]
+    K --> CH
+    CH -->|原文段落，不經 RAP| E
+    F[使用者提問 + 先前對話] --> G[rag_engine]
     E -->|相似度檢索| G
-    G -->|RAP LLM 生成| H[結構化商務對齊回答]
+    G -->|RAP LLM 生成| H[依意圖產生的回答 + 引用來源]
     H --> I[Streamlit 介面]
 ```
 
@@ -75,6 +80,8 @@ cp .env.example .env
 | `GITHUB_TOKEN` | GitHub Personal Access Token（需有目標私有倉庫的讀取權限；若啟用快取，還需對 `CACHE_REPO` 有寫入權限） |
 | `GITHUB_REPO` | 目標倉庫，格式 `owner/repo` |
 | `CHROMA_PERSIST_DIR` | ChromaDB 本地儲存路徑，預設 `./chroma_data` |
+| `EMBEDDING_MODEL` | 選填，fastembed 支援的 ONNX embedding 模型，預設 `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`；更換後本地向量資料自動清空，頁面載入時從快取還原 |
+| `RAG_TOP_K` | 選填，每次提問檢索的卡片＋段落數，預設 `8` |
 | `CACHE_ENABLED` | 選填，是否啟用功能卡片快取，預設 `true` |
 | `CACHE_REPO` | 選填，快取檔案要寫回哪個 repo（`owner/repo`）；留空 = 停用快取 |
 | `CACHE_FILE_PATH` | 選填，快取檔案路徑，預設 `pmec_cache/feature_cards.json` |
@@ -83,8 +90,9 @@ cp .env.example .env
 | `GDRIVE_SERVICE_ACCOUNT_JSON` | 啟用 Drive 時必填，Service Account 金鑰 JSON 檔路徑（相對路徑以專案根目錄為準，建議放 `./secrets/`，已被 `.gitignore` 排除），或直接貼上整份金鑰 JSON |
 | `GDRIVE_MAX_FILES` | 選填，每次同步最多讀取的 Drive 檔案數，預設 `100`（首次同步每份文件各呼叫一次 RAP 摘要） |
 
-> Embedding 固定使用 ChromaDB 內建的輕量 ONNX 模型（`all-MiniLM-L6-v2`，
-> 免費、純 CPU、不需要 `torch`），刻意不採用 `sentence-transformers`：後者
+> Embedding 使用 fastembed 載入 ONNX 模型（預設 `paraphrase-multilingual-MiniLM-L12-v2`，約 220MB，
+> 首次啟動自動下載；支援中文、純 CPU、不需要 `torch`）。ChromaDB 內建的 `all-MiniLM-L6-v2` 只訓練英文，
+> 中文查詢時內容完全對應的卡片可能排到 20 名外，因此不採用。刻意不採用 `sentence-transformers`：後者
 > 會拉入 GB 等級的 torch 依賴，在 Streamlit Community Cloud 這類 1GB RAM
 > 的免費部署環境容易 build 失敗或執行期 OOM。
 
@@ -95,8 +103,14 @@ cp .env.example .env
 3. 設定 `GDRIVE_FOLDER_IDS`、`GDRIVE_SERVICE_ACCOUNT_JSON` 後執行 `python scripts/check_gdrive_connection.py`，確認列出的文件與略過清單符合預期。
 
 支援格式：Google 文件 / 試算表（所有工作表）/ 簡報、txt / md / csv / tsv / json、PDF（僅文字層）、docx / xlsx / pptx；
-其餘格式（圖片、影片、捷徑、舊版 .doc/.xls/.ppt、掃描影像 PDF）會略過。每份文件摘要成一張功能卡片，
-同一檔案只保留最新版本的卡片；檔案從資料夾移除後，下次同步（掃描完整時）即從知識庫移除。
+其餘格式（圖片、影片、捷徑、舊版 .doc/.xls/.ppt、掃描影像 PDF）會略過。
+
+每份文件會產生兩種知識：
+- **功能卡片**：RAP LLM 讀文件前 6,000 字寫成的概要，寫入快取；同一檔案只保留最新版本，檔案從資料夾移除後，
+  下次同步（掃描完整時）即從知識庫移除。
+- **原文段落**：全文（單檔上限 50 萬字，超過時同步進度會提示）切成約 300 字的段落，本地 embedding、不消耗 RAP。
+  試算表與 csv / tsv 以「欄名：值｜欄名：值」逐列呈現、段落前綴帶工作表名稱，讓「P3 的資安項目」這類細節可被檢索。
+  段落不寫入快取：每次同步、以及冷啟動從快取還原時，都會重新抓取 GitHub / Drive 原文重建（免費，但冷啟動需多等抓取時間）。
 
 ## 執行
 
@@ -118,14 +132,18 @@ streamlit run app.py
    用 RAP LLM 轉譯功能卡片 → `vector_store` 寫入 ChromaDB → 更新後的快取寫回
    `CACHE_REPO`。用於手動抓取「新」的內容（新 PR、README/API 規格或 Drive 文件
    有變動）；本地知識庫已還原時不需要每次都點擊。
-4. 於主畫面聊天輸入框，輸入商務問題，例如：
-   - 「我們的系統有支援 CSV 批量匯入名單嗎？」
+4. 於主畫面聊天輸入框提問，例如：
+   - 「目前支援哪些部署方式？」
+   - 「負載平衡器的逾時設定是多少？」→ 追問「那資料庫連線呢？」
    - 「我們能不能承諾客戶支援即時推送？」
-5. 系統會回傳四段式結構化分析：
-   - 【能否承諾客戶】：可以 / 有條件可以 / 目前無法
-   - 【現況支援程度】：非技術語言說明
-   - 【差距與風險（Gap Analysis）】：規格落差與技術限制
-   - 【建議對外溝通說法】：可直接對客戶發送的說法
+5. 助理依問題類型決定回答形式，不套用固定範本：
+   - 事實 / 功能查詢：直接回答有無，再說明依據。
+   - 進度 / 規劃：說明目前狀態與依據。
+   - 對客戶承諾：評估「可以 / 有條件可以 / 目前無法」、差距與風險，並附建議對外說法。
+   - 知識庫找不到相關資料時明確說明，不臆測。
+
+   回答以 `[n]` 標註引用，對應下方「參考資料」展開區的來源；追問時會帶入最近 3 輪對話
+   （`rag_engine.MAX_HISTORY_TURNS`）。
 
 ## 常見問題
 

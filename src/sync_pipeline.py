@@ -16,9 +16,11 @@ Summarizer (RAP LLM) → VectorStore。
        的快取項目永久保留，即使該文件之後不在 GitHub 抓取的時間窗內
        （例如 PR_FETCH_LIMIT 之外的舊 PR），也不會遺失。
     4. 把快取中「全部」卡片（含本次重用與新摘要）重新寫入 ChromaDB——
-       embedding 用 ChromaDB 內建免費模型，即使向量資料庫被 ephemeral
+       embedding 用本地免費 ONNX 模型，即使向量資料庫被 ephemeral
        環境清空，也能用快取零成本（不花 RAP 額度）重建。
-    5. 若有新增摘要，才把合併後的快取寫回 GitHub，供下次啟動使用。
+    5. 把本次抓到的所有文件原文切段 (chunker) 寫入 ChromaDB，取代舊段落；
+       段落不經 RAP，每次都從來源重新產生，不寫入快取。
+    6. 若有新增摘要，才把合併後的快取寫回 GitHub，供下次啟動使用。
 
 Drive 卡片例外：同檔案只保留最新版本，檔案移出資料夾（掃描完整時）即自快取與
 ChromaDB 移除。
@@ -26,10 +28,13 @@ ChromaDB 移除。
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Tuple
 
 from src import config
 from src.card_cache import CardCache, CardCacheError, doc_identity, prune_gdrive_entries
+from src.chunker import chunk_document
+from src.config import ConfigError
+from src.documents import ExtractedDocument
 from src.gdrive_extractor import GDriveExtractor, GDriveExtractorError, GDriveExtractResult
 from src.github_extractor import GitHubExtractor, GitHubExtractorError
 from src.summarizer import FeatureCard, Summarizer, SummarizerError
@@ -47,9 +52,45 @@ class SyncResult:
     new_count: int
     failed_count: int
     removed_count: int
+    chunk_count: int
     total_in_db: int
     cache_used: bool
     cache_warning: Optional[str] = None
+
+
+def _extract_sources(report: ProgressFn) -> Tuple[List[ExtractedDocument], Optional[GDriveExtractResult]]:
+    """抓取 GitHub 與（有設定時）Google Drive 文件；全部為空時拋出對應例外。"""
+    report(f"連線 GitHub 並抓取 `{config.GITHUB_REPO}` 的 README / API 規格 / 近期已合併 PR ...")
+    docs = GitHubExtractor().extract_all()
+    report(f"GitHub：共抓取到 {len(docs)} 份原始文件。")
+
+    drive_result: Optional[GDriveExtractResult] = None
+    if config.GDRIVE_ENABLED:
+        report(f"連線 Google Drive 並掃描 {len(config.GDRIVE_FOLDER_IDS)} 個資料夾（含子資料夾）...")
+        drive_result = GDriveExtractor().extract_all()
+        docs.extend(drive_result.docs)
+        report(
+            f"Google Drive：共讀取 {len(drive_result.docs)} 份文件，"
+            f"略過 {len(drive_result.skipped)} 份（不支援的格式或無法讀取）。"
+        )
+        for path in drive_result.truncated:
+            report(f"⚠️ 「{path}」內容過長，只收錄前段（超出部分無法被檢索）。")
+        if not drive_result.complete:
+            report(
+                f"⚠️ Google Drive 掃描未完整（已達 GDRIVE_MAX_FILES={config.GDRIVE_MAX_FILES} 上限或部分子資料夾讀取失敗），"
+                "本次不會移除已從 Drive 刪除的舊卡片。"
+            )
+    if not docs:
+        if drive_result is None:
+            raise GitHubExtractorError("未抓取到任何 README / API 規格 / 已合併 PR，請確認倉庫內容或權限設定。")
+        raise GDriveExtractorError("GitHub 與 Google Drive 皆未抓取到任何文件，請確認倉庫內容、資料夾內容與權限設定。")
+    return docs, drive_result
+
+
+def _index_chunks(vector_store: VectorStore, docs: List[ExtractedDocument], report: ProgressFn) -> int:
+    chunks = [chunk for doc in docs for chunk in chunk_document(doc)]
+    report(f"將 {len(docs)} 份文件原文切成 {len(chunks)} 段並寫入向量資料庫（本地 embedding，不消耗 RAP）...")
+    return vector_store.replace_chunks(chunks)
 
 
 def run_sync(vector_store: VectorStore, progress: Optional[ProgressFn] = None) -> SyncResult:
@@ -61,29 +102,7 @@ def run_sync(vector_store: VectorStore, progress: Optional[ProgressFn] = None) -
 
     config.require_valid(require_github=True, require_rap=True, require_gdrive=config.GDRIVE_ENABLED)
 
-    _report(f"連線 GitHub 並抓取 `{config.GITHUB_REPO}` 的 README / API 規格 / 近期已合併 PR ...")
-    extractor = GitHubExtractor()
-    docs = extractor.extract_all()
-    _report(f"GitHub：共抓取到 {len(docs)} 份原始文件。")
-
-    drive_result: Optional[GDriveExtractResult] = None
-    if config.GDRIVE_ENABLED:
-        _report(f"連線 Google Drive 並掃描 {len(config.GDRIVE_FOLDER_IDS)} 個資料夾（含子資料夾）...")
-        drive_result = GDriveExtractor().extract_all()
-        docs.extend(drive_result.docs)
-        _report(
-            f"Google Drive：共讀取 {len(drive_result.docs)} 份文件，"
-            f"略過 {len(drive_result.skipped)} 份（不支援的格式或無法讀取）。"
-        )
-        if not drive_result.complete:
-            _report(
-                f"⚠️ Google Drive 掃描未完整（已達 GDRIVE_MAX_FILES={config.GDRIVE_MAX_FILES} 上限或部分子資料夾讀取失敗），"
-                "本次不會移除已從 Drive 刪除的舊卡片。"
-            )
-    if not docs:
-        if drive_result is None:
-            raise GitHubExtractorError("未抓取到任何 README / API 規格 / 已合併 PR，請確認倉庫內容或權限設定。")
-        raise GDriveExtractorError("GitHub 與 Google Drive 皆未抓取到任何文件，請確認倉庫內容、資料夾內容與權限設定。")
+    docs, drive_result = _extract_sources(_report)
     _report(f"共抓取到 {len(docs)} 份原始文件。")
 
     cache: dict = {}
@@ -154,8 +173,9 @@ def run_sync(vector_store: VectorStore, progress: Optional[ProgressFn] = None) -
         # 先清掉 ChromaDB 中所有 Drive 卡片再以快取重建，讓已移除／過期的卡片不殘留
         vector_store.delete_by_doc_type("gdrive")
     vector_store.upsert_cards(all_cards)
+    chunk_count = _index_chunks(vector_store, docs, _report)
     total_in_db = vector_store.count()
-    _report(f"目前資料庫共 {total_in_db} 筆功能卡片（快取累積總數 {len(all_cards)} 筆）。")
+    _report(f"目前資料庫共 {total_in_db} 筆（功能卡片 {len(all_cards)} 張、原文段落 {chunk_count} 段）。")
 
     if card_cache is not None and (new_count > 0 or removed_count > 0):
         try:
@@ -172,6 +192,7 @@ def run_sync(vector_store: VectorStore, progress: Optional[ProgressFn] = None) -
         new_count=new_count,
         failed_count=failed_count,
         removed_count=removed_count,
+        chunk_count=chunk_count,
         total_in_db=total_in_db,
         cache_used=cache_used and card_cache is not None,
         cache_warning=cache_warning,
@@ -181,17 +202,19 @@ def run_sync(vector_store: VectorStore, progress: Optional[ProgressFn] = None) -
 @dataclass
 class BootstrapResult:
     card_count: int
+    chunk_count: int
     total_in_db: int
+    chunk_warning: Optional[str] = None
 
 
 def bootstrap_from_cache(vector_store: VectorStore) -> Optional[BootstrapResult]:
-    """僅用 GitHub 上既有的功能卡片快取還原本地 ChromaDB，不呼叫 GitHubExtractor、
-    不呼叫 RAP LLM。用於 App 冷啟動時本地向量資料庫是空的（ephemeral 檔案系統重建
-    或首次啟動），但 GitHub 上已有先前累積的快取，讓使用者一進入頁面就能直接提問，
-    不必手動點擊「同步並更新」並等待完整流程。
+    """用 GitHub 上既有的功能卡片快取還原本地 ChromaDB，並重新抓取來源文件建立原文段落；
+    全程不呼叫 RAP LLM。用於 App 冷啟動時本地向量資料庫是空的（ephemeral 檔案系統重建、
+    首次啟動或更換 embedding 模型），讓使用者一進入頁面就能直接提問。
 
     快取未啟用、未設定 CACHE_REPO、或快取內容目前是空的，回傳 None（呼叫端應提示
     使用者改用「同步並更新」建立知識庫）。讀取快取失敗時拋出 CardCacheError。
+    抓取來源失敗不影響卡片還原，只回報於 chunk_warning。
     """
     if not (config.CACHE_ENABLED and config.CACHE_REPO):
         return None
@@ -208,5 +231,20 @@ def bootstrap_from_cache(vector_store: VectorStore) -> Optional[BootstrapResult]
 
     all_cards = [FeatureCard(**fields) for fields in cache.values()]
     vector_store.upsert_cards(all_cards)
-    total_in_db = vector_store.count()
-    return BootstrapResult(card_count=len(all_cards), total_in_db=total_in_db)
+
+    chunk_count = 0
+    chunk_warning: Optional[str] = None
+    try:
+        config.require_valid(require_github=True, require_rap=False, require_gdrive=config.GDRIVE_ENABLED)
+        docs, _ = _extract_sources(logger.info)
+        chunk_count = _index_chunks(vector_store, docs, logger.info)
+    except (ConfigError, GitHubExtractorError, GDriveExtractorError) as exc:
+        chunk_warning = f"已從快取還原功能卡片，但抓取原文失敗，目前只能檢索卡片摘要：{exc}"
+        logger.warning(chunk_warning)
+
+    return BootstrapResult(
+        card_count=len(all_cards),
+        chunk_count=chunk_count,
+        total_in_db=vector_store.count(),
+        chunk_warning=chunk_warning,
+    )

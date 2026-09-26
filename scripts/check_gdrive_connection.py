@@ -62,6 +62,11 @@ def main() -> None:
     for item in result.skipped:
         print(f"- {item}")
 
+    if result.truncated:
+        print(f"\n內容過長、只收錄前段的檔案（{len(result.truncated)} 份）：")
+        for path in result.truncated:
+            print(f"- {path}")
+
     print(f"\n掃描完整: {result.complete}")
     print(f"[OK] Google Drive 讀取正常：{len(result.docs)} 份文件")
 

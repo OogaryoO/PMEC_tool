@@ -112,17 +112,16 @@ def step3_rag_engine(card) -> None:
 
         try:
             engine = RAGEngine(vector_store=vs, repo_name="example/example")
-            answer = engine.answer("我們能不能承諾客戶支援 CSV 批量匯入名單？")
+            answer = engine.answer("目前系統支援 CSV 批量匯入名單嗎？")
         except RAGEngineError as exc:
             _fail("step3 RAGEngine", exc)
         except Exception as exc:  # noqa: BLE001
             _fail("step3 RAGEngine (未預期例外)", exc)
 
     print(f"    檢索到 {len(answer.retrieved)} 張卡片")
-    print(f"    解析出的區塊鍵: {list(answer.sections.keys())}")
-    print("    --- raw_markdown ---")
-    print("    " + answer.raw_markdown.replace("\n", "\n    "))
-    assert answer.sections, "應至少解析出一個【區塊】，代表 LLM 有照格式輸出"
+    print("    --- markdown ---")
+    print("    " + answer.markdown.replace("\n", "\n    "))
+    assert answer.markdown.strip(), "RAP LLM 應回傳非空回答"
     print("[OK] RAGEngine 路徑通過\n")
 
 

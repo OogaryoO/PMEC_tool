@@ -4,17 +4,20 @@
 
 支援格式：
     - Google 文件 / 簡報（匯出純文字）、Google 試算表（匯出 xlsx，讀取所有工作表）
-    - txt / md / csv / tsv / json
+    - txt / md / json、csv / tsv
     - PDF（僅文字層；掃描影像無法擷取）
     - docx / xlsx / pptx
+試算表與 csv / tsv 以「欄名：值｜欄名：值」逐列輸出，讓每一列單獨被切段檢索時仍保有欄位意義。
 其餘格式（圖片、影片、表單、捷徑、舊版 .doc/.xls/.ppt 等）一律略過，列入略過清單。
 """
 from __future__ import annotations
 
+import csv
+import datetime as dt
 import io
 import json
 from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 import docx
 import openpyxl
@@ -51,7 +54,9 @@ TEXT_MIMES = {
     "application/json",
 }
 SUPPORTED_MIMES = set(GOOGLE_EXPORTS) | TEXT_MIMES | {PDF_MIME, DOCX_MIME, XLSX_MIME, PPTX_MIME}
-MAX_TEXT_CHARS = 40_000  # 與 github_extractor.MAX_FILE_BYTES 同級
+# 單檔擷取上限（字元）：原文會切段做本地 embedding，不消耗 RAP 額度；功能卡片摘要另只讀前段
+# （documents.ExtractedDocument.to_llm_text）。上限只防止異常大檔拖垮記憶體與同步時間。
+MAX_TEXT_CHARS = 500_000
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 LIST_FIELDS = "nextPageToken, files(id, name, mimeType, modifiedTime, size, webViewLink)"
 API_RETRIES = 3
@@ -66,6 +71,7 @@ class GDriveExtractResult:
     docs: List[ExtractedDocument]
     seen_file_ids: Set[str]  # 本次掃描到的「支援格式」檔案 ID（含讀取失敗、無文字、過大者）
     skipped: List[str]  # 人類可讀「路徑（原因）」
+    truncated: List[str]  # 超過 MAX_TEXT_CHARS 被截斷的檔案路徑
     complete: bool  # False = 達 max_files 上限或有子資料夾列舉失敗
 
 
@@ -106,18 +112,63 @@ def _docx_to_text(data: bytes) -> str:
     return _join_capped(_docx_lines(docx.Document(io.BytesIO(data))))
 
 
+def _cell_text(value) -> str:
+    if isinstance(value, dt.datetime):
+        return value.date().isoformat() if value.time() == dt.time() else value.isoformat(" ", "minutes")
+    # 儲存格內換行會被切段誤判為新列，統一壓成單一空白
+    return "" if value is None else " ".join(str(value).split())
+
+
+def _is_label(value) -> bool:
+    """表頭儲存格應是文字標籤；日期、數字（含 csv 中的數字字串）代表這列是資料。"""
+    if not isinstance(value, str):
+        return False
+    try:
+        float(value.replace(",", ""))
+        return False
+    except ValueError:
+        return True
+
+
+def _table_lines(rows: Iterable[Sequence]) -> Iterator[str]:
+    """第一個至少有兩格內容的列，若多數儲存格是文字標籤則視為表頭，之後每列輸出
+    「欄名：值｜欄名：值」（略過空格）；否則（例如日曆式排程表，首列是日期）整張表視為
+    無表頭，每列以「｜」串接。表頭之前的單格列（例如 A1 的表格標題）原樣輸出。"""
+    header: Optional[List[str]] = None  # None = 尚未判定；[] = 無表頭
+    for row in rows:
+        cells = [_cell_text(v) for v in row]
+        filled = [c for c in cells if c]
+        if not filled:
+            continue
+        if header is None:
+            if len(filled) < 2:
+                yield filled[0]
+                continue
+            labels = sum(1 for v, c in zip(row, cells) if c and _is_label(v))
+            if labels * 2 > len(filled):
+                header = cells
+                yield "欄位：" + "｜".join(filled)
+                continue
+            header = []
+        if not header:
+            yield "｜".join(filled)
+            continue
+        yield "｜".join(
+            f"{header[i] if i < len(header) and header[i] else f'欄{i + 1}'}：{c}"
+            for i, c in enumerate(cells)
+            if c
+        )
+
+
 def _xlsx_lines(workbook) -> Iterator[str]:
     for ws in workbook.worksheets:
-        header_emitted = False
-        for row in ws.iter_rows(values_only=True):
-            line = "\t".join("" if v is None else str(v) for v in row).rstrip()
-            if not line.strip():
-                continue
-            if not header_emitted:
-                # 工作表標題只在該表有內容時輸出，全空工作表不產生任何文字
-                yield f"## 工作表：{ws.title}"
-                header_emitted = True
-            yield line
+        lines = _table_lines(ws.iter_rows(values_only=True))
+        first = next(lines, None)
+        if first is None:
+            continue  # 全空工作表不產生任何文字
+        yield f"## 工作表：{ws.title}"
+        yield first
+        yield from lines
 
 
 def _xlsx_to_text(data: bytes) -> str:
@@ -126,6 +177,10 @@ def _xlsx_to_text(data: bytes) -> str:
         return _join_capped(_xlsx_lines(workbook))
     finally:
         workbook.close()
+
+
+def _delimited_to_text(data: bytes, delimiter: str) -> str:
+    return _join_capped(_table_lines(csv.reader(io.StringIO(_decode_text(data)), delimiter=delimiter)))
 
 
 def _pptx_lines(presentation) -> Iterator[str]:
@@ -270,6 +325,10 @@ class GDriveExtractor:
             return _xlsx_to_text(data) if export_mime == XLSX_MIME else _decode_text(data)
 
         data = files.get_media(fileId=item["id"], supportsAllDrives=True).execute(num_retries=API_RETRIES)
+        if mime == "text/csv":
+            return _delimited_to_text(data, ",")
+        if mime == "text/tab-separated-values":
+            return _delimited_to_text(data, "\t")
         if mime in TEXT_MIMES:
             return _decode_text(data)
         return _BINARY_PARSERS[mime](data)
@@ -280,6 +339,7 @@ class GDriveExtractor:
         docs: List[ExtractedDocument] = []
         seen: Set[str] = set()
         skipped: List[str] = []
+        truncated: List[str] = []
         visited: Set[str] = set()
         complete = True
         limit_reached = False
@@ -331,6 +391,8 @@ class GDriveExtractor:
                     if not text:
                         skipped.append(f"{path}（沒有可擷取的文字，可能是掃描影像）")
                         continue
+                    if len(text) >= MAX_TEXT_CHARS:
+                        truncated.append(path)
 
                     docs.append(
                         ExtractedDocument(
@@ -355,4 +417,6 @@ class GDriveExtractor:
                 break
 
         logger.info("從 Google Drive 讀取到 %d 份文件（略過 %d 份）。", len(docs), len(skipped))
-        return GDriveExtractResult(docs=docs, seen_file_ids=seen, skipped=skipped, complete=complete)
+        return GDriveExtractResult(
+            docs=docs, seen_file_ids=seen, skipped=skipped, truncated=truncated, complete=complete
+        )

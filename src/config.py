@@ -52,6 +52,8 @@ GITHUB_REPO: str = os.getenv("GITHUB_REPO", "")  # 格式: owner/repo
 # --- ChromaDB ---
 CHROMA_PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_data")
 CHROMA_COLLECTION_NAME: str = os.getenv("CHROMA_COLLECTION_NAME", "github_feature_cards")
+# fastembed 支援的 ONNX 模型；換模型後既有 collection 會自動清空，需從快取還原或重新同步。
+EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
 # --- 功能卡片快取（寫回 GitHub repo，避免 ephemeral 部署環境重複消耗 RAP 額度） ---
 # CACHE_REPO 留空 = 停用快取，每次同步都會對所有抓到的文件重新呼叫 RAP LLM 摘要。
@@ -76,7 +78,7 @@ GDRIVE_ENABLED: bool = bool(GDRIVE_FOLDER_IDS)
 
 # --- 其他可調參數 ---
 PR_FETCH_LIMIT: int = int(os.getenv("PR_FETCH_LIMIT", "20"))
-RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "4"))
+RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "8"))
 LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.2"))
 LLM_REQUEST_TIMEOUT: float = float(os.getenv("LLM_REQUEST_TIMEOUT", "60"))
 
@@ -92,6 +94,7 @@ class Settings:
     github_repo: str = GITHUB_REPO
     chroma_persist_dir: str = CHROMA_PERSIST_DIR
     chroma_collection_name: str = CHROMA_COLLECTION_NAME
+    embedding_model: str = EMBEDDING_MODEL
     cache_enabled: bool = CACHE_ENABLED
     cache_repo: str = CACHE_REPO
     cache_file_path: str = CACHE_FILE_PATH
