@@ -65,6 +65,15 @@ CACHE_BRANCH: str = os.getenv("CACHE_BRANCH", "")  # 空字串 = 該 repo 的預
 # （相容舊設定，但代表 GITHUB_TOKEN 需同時具備兩邊權限）。
 CACHE_GITHUB_TOKEN: str = os.getenv("CACHE_GITHUB_TOKEN", "") or GITHUB_TOKEN
 
+# --- Google Drive（選填：GDRIVE_FOLDER_IDS 有值即啟用） ---
+GDRIVE_FOLDER_IDS: List[str] = [
+    s.strip() for s in os.getenv("GDRIVE_FOLDER_IDS", "").split(",") if s.strip()
+]
+# Service Account 金鑰：JSON 檔路徑（相對路徑以 PROJECT_ROOT 為準），或直接貼上 JSON 內容（以 "{" 開頭）。
+GDRIVE_SERVICE_ACCOUNT_JSON: str = os.getenv("GDRIVE_SERVICE_ACCOUNT_JSON", "").strip()
+GDRIVE_MAX_FILES: int = int(os.getenv("GDRIVE_MAX_FILES", "100"))
+GDRIVE_ENABLED: bool = bool(GDRIVE_FOLDER_IDS)
+
 # --- 其他可調參數 ---
 PR_FETCH_LIMIT: int = int(os.getenv("PR_FETCH_LIMIT", "20"))
 RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "4"))
@@ -97,7 +106,14 @@ def get_settings() -> Settings:
     return Settings()
 
 
-def validate(require_github: bool = True, require_rap: bool = True) -> List[str]:
+def resolve_gdrive_credentials_path(raw: str) -> Path:
+    """GDRIVE_SERVICE_ACCOUNT_JSON 為檔案路徑時的實際位置；相對路徑以專案根目錄為準。"""
+    return PROJECT_ROOT / Path(raw).expanduser()
+
+
+def validate(
+    require_github: bool = True, require_rap: bool = True, require_gdrive: bool = False
+) -> List[str]:
     """
     檢查必要設定是否齊全。
 
@@ -121,11 +137,32 @@ def validate(require_github: bool = True, require_rap: bool = True) -> List[str]
         if not RAP_MODEL_NAME:
             missing.append("RAP_MODEL_NAME 未設定：請確認要使用的模型名稱。")
 
+    if require_gdrive:
+        if not GDRIVE_FOLDER_IDS:
+            missing.append(
+                "GDRIVE_FOLDER_IDS 未設定：請填入 Google Drive 資料夾 ID"
+                "（網址 https://drive.google.com/drive/folders/<ID> 的 <ID>），多個以逗號分隔。"
+            )
+        if not GDRIVE_SERVICE_ACCOUNT_JSON:
+            missing.append(
+                "GDRIVE_SERVICE_ACCOUNT_JSON 未設定：請填入 Service Account 金鑰 JSON 檔路徑，或直接貼上金鑰 JSON 內容。"
+            )
+        elif (
+            not GDRIVE_SERVICE_ACCOUNT_JSON.startswith("{")
+            and not resolve_gdrive_credentials_path(GDRIVE_SERVICE_ACCOUNT_JSON).is_file()
+        ):
+            missing.append(
+                "GDRIVE_SERVICE_ACCOUNT_JSON 指定的金鑰檔不存在："
+                f"{resolve_gdrive_credentials_path(GDRIVE_SERVICE_ACCOUNT_JSON)}"
+            )
+
     return missing
 
 
-def require_valid(require_github: bool = True, require_rap: bool = True) -> None:
+def require_valid(
+    require_github: bool = True, require_rap: bool = True, require_gdrive: bool = False
+) -> None:
     """設定不齊全時直接拋出 ConfigError，訊息可直接顯示給使用者。"""
-    missing = validate(require_github=require_github, require_rap=require_rap)
+    missing = validate(require_github=require_github, require_rap=require_rap, require_gdrive=require_gdrive)
     if missing:
         raise ConfigError("設定不完整，請檢查 .env：\n- " + "\n- ".join(missing))

@@ -1,7 +1,7 @@
 """
 Streamlit 前端：PM ↔ GitHub 商務對齊助理。
 
-側邊欄：連線狀態、目標 Repo、一鍵同步 GitHub 知識庫。
+側邊欄：連線狀態、目標 Repo / Google Drive 資料夾、一鍵同步知識庫。
 主畫面：PM 提問聊天介面，回答以結構化卡片呈現。
 """
 from __future__ import annotations
@@ -13,6 +13,7 @@ import streamlit as st
 
 from src import config
 from src.config import ConfigError
+from src.gdrive_extractor import GDriveExtractorError
 from src.github_extractor import GitHubExtractorError
 from src.rag_engine import RAGAnswer, RAGEngine, RAGEngineError
 from src.summarizer import SummarizerError
@@ -72,7 +73,7 @@ if "last_sync_info" not in st.session_state:
 # Sync pipeline: Extractor -> Summarizer -> VectorStore
 # ---------------------------------------------------------------------------
 def run_sync_pipeline(vector_store: VectorStore) -> None:
-    with st.status("同步 GitHub 知識庫中...", expanded=True) as status:
+    with st.status("同步知識庫中...", expanded=True) as status:
         try:
             def _progress(msg: str) -> None:
                 st.write(msg)
@@ -85,6 +86,7 @@ def run_sync_pipeline(vector_store: VectorStore) -> None:
                 "reused_count": result.reused_count,
                 "new_count": result.new_count,
                 "failed_count": result.failed_count,
+                "removed_count": result.removed_count,
                 "total_in_db": result.total_in_db,
                 "cache_used": result.cache_used,
             }
@@ -97,6 +99,9 @@ def run_sync_pipeline(vector_store: VectorStore) -> None:
             st.error(str(exc))
         except GitHubExtractorError as exc:
             status.update(label="GitHub 資料抓取失敗。", state="error")
+            st.error(str(exc))
+        except GDriveExtractorError as exc:
+            status.update(label="Google Drive 資料抓取失敗。", state="error")
             st.error(str(exc))
         except SummarizerError as exc:
             status.update(label="LLM 摘要失敗。", state="error")
@@ -135,6 +140,7 @@ if not st.session_state.cache_bootstrap_attempted:
                         "reused_count": _result.card_count,
                         "new_count": 0,
                         "failed_count": 0,
+                        "removed_count": 0,
                         "total_in_db": _result.total_in_db,
                         "cache_used": True,
                     }
@@ -154,6 +160,10 @@ with st.sidebar:
     st.title("⚙️ 連線狀態")
 
     st.markdown(f"**目標 Repo**：`{config.GITHUB_REPO or '（未設定）'}`")
+    if config.GDRIVE_ENABLED:
+        st.markdown("**Google Drive 資料夾**：" + "、".join(f"`{fid}`" for fid in config.GDRIVE_FOLDER_IDS))
+    else:
+        st.markdown("**Google Drive 資料夾**：未設定（僅同步 GitHub）")
     st.markdown(f"**RAP 模型**：`{config.RAP_MODEL_NAME or '（未設定）'}`")
     st.markdown(f"**RAP 端點**：`{config.RAP_BASE_URL or '（未設定）'}`")
     if config.CACHE_ENABLED and config.CACHE_REPO:
@@ -169,6 +179,11 @@ with st.sidebar:
 
     github_missing = config.validate(require_github=True, require_rap=False)
     rap_missing = config.validate(require_github=False, require_rap=True)
+    gdrive_missing = (
+        config.validate(require_github=False, require_rap=False, require_gdrive=True)
+        if config.GDRIVE_ENABLED
+        else []
+    )
 
     if not github_missing:
         st.success("GitHub 設定完整")
@@ -184,6 +199,14 @@ with st.sidebar:
         for m in rap_missing:
             st.caption(f"⚠️ {m}")
 
+    if config.GDRIVE_ENABLED:
+        if not gdrive_missing:
+            st.success("Google Drive 設定完整")
+        else:
+            st.error("Google Drive 設定不完整")
+            for m in gdrive_missing:
+                st.caption(f"⚠️ {m}")
+
     st.divider()
 
     vector_store, vs_error = try_get_vector_store()
@@ -196,12 +219,12 @@ with st.sidebar:
         except VectorStoreError as exc:
             st.error(str(exc))
 
-    sync_disabled = bool(github_missing or rap_missing or vs_error)
-    if st.button("🔄 同步並更新 GitHub 知識庫", use_container_width=True, disabled=sync_disabled):
+    sync_disabled = bool(github_missing or rap_missing or gdrive_missing or vs_error)
+    if st.button("🔄 同步並更新知識庫", use_container_width=True, disabled=sync_disabled):
         run_sync_pipeline(vector_store)
 
     if sync_disabled and not vs_error:
-        st.caption("請先完成上方 GitHub / RAP 設定才能同步。")
+        st.caption("請先完成上方 GitHub / RAP / Google Drive 設定才能同步。")
 
     if st.session_state.last_sync_info:
         info = st.session_state.last_sync_info
@@ -209,7 +232,8 @@ with st.sidebar:
             f"上次同步：{info['time']}\n\n"
             f"抓取文件 {info['doc_count']} 份 → 重用快取 {info['reused_count']} 份／"
             f"新摘要 {info['new_count']} 份（{info['failed_count']} 份失敗）\n\n"
-            f"資料庫目前共 {info['total_in_db']} 筆\n\n"
+            + (f"移除過期 Drive 卡片 {info['removed_count']} 張\n\n" if info.get("removed_count", 0) > 0 else "")
+            + f"資料庫目前共 {info['total_in_db']} 筆\n\n"
             f"快取：{'已啟用' if info['cache_used'] else '未啟用'}"
         )
 
@@ -263,7 +287,7 @@ def render_answer(answer: RAGAnswer) -> None:
 
     with st.expander(f"🔍 檢索到的相關功能卡片（{len(answer.retrieved)} 筆）"):
         if not answer.retrieved:
-            st.caption("知識庫中查無相關資料，建議先執行「同步並更新 GitHub 知識庫」。")
+            st.caption("知識庫中查無相關資料，建議先執行「同步並更新知識庫」。")
         for card in answer.retrieved:
             st.markdown(
                 f"- **{card.feature_name}**（{card.status}）— {card.business_scenario}"

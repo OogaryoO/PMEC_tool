@@ -1,5 +1,5 @@
 """
-呼叫 RAP LLM（相容 OpenAI SDK）將原始的 README / API 規格 / PR
+呼叫 RAP LLM（相容 OpenAI SDK）將原始的 README / API 規格 / PR / Google Drive 文件
 轉譯為 PM 看得懂的「功能卡片」：
 
     - 功能名稱 (feature_name)
@@ -19,7 +19,7 @@ import openai
 from openai import OpenAI
 
 from src import config
-from src.github_extractor import ExtractedDocument
+from src.documents import ExtractedDocument
 
 logger = config.get_logger(__name__)
 
@@ -30,7 +30,7 @@ class SummarizerError(Exception):
 
 SYSTEM_PROMPT = (
     "你是一位資深的技術 PM 助理，任務是把工程師的原始程式碼變更、PR 說明、"
-    "README 或 API 規格，「翻譯」成業務人員 (PM / Sales / 客戶) 看得懂的功能卡片。"
+    "README、API 規格或組織內部文件，「翻譯」成業務人員 (PM / Sales / 客戶) 看得懂的功能卡片。"
     "你只輸出 JSON，不要輸出任何多餘的文字、Markdown 標記或程式碼區塊符號。"
 )
 
@@ -54,6 +54,29 @@ USER_PROMPT_TEMPLATE = """\
 1. 若來源資料看起來只是雜務性變更（例如格式調整、CI 設定、依賴升級），
    請將 feature_name 標註為「(非功能性變更)」，business_scenario 可簡短說明原因，status 設為 "已上線"。
 2. 禁止杜撰不存在的功能或誇大狀態；資料不足時請在 status 或 key_points 中誠實反映。
+3. 只輸出 JSON，不要有任何前後綴文字。
+"""
+
+DRIVE_USER_PROMPT_TEMPLATE = """\
+請閱讀以下來自組織 Google Drive 的內部文件，整理成一張「功能卡片」，重點是這份文件揭露了我們能對客戶提供的產品能力、服務範圍、流程或限制。
+
+來源資料：
+---
+{doc_text}
+---
+
+請嚴格以下列 JSON 格式輸出（欄位皆為繁體中文內容，key 保持英文）：
+{{
+  "feature_name": "文件描述的主要功能／服務／主題名稱，簡短、商業導向，避免技術術語",
+  "business_scenario": "這份文件可以支援哪些商業場景／客戶需求的判斷，用 1-3 句話說明",
+  "status": "已上線 / 開發中 / 限制，三選一，依文件內容判斷並附註簡短原因；若文件只是規劃或提案，填「開發中」並註明（規劃文件）",
+  "key_points": ["條列 1-3 個重點，例如承諾條件、關鍵數字（價格、SLA、上限）、適用範圍"]
+}}
+
+注意事項：
+1. 若文件與產品能力或對客戶承諾無關（例如行政公告、會議室預約、個人筆記），
+   請將 feature_name 標註為「(非產品相關文件)」，business_scenario 簡短說明文件性質，status 設為 "不適用"。
+2. 禁止杜撰文件中不存在的內容或誇大狀態；資料不足時請在 status 或 key_points 中誠實反映。
 3. 只輸出 JSON，不要有任何前後綴文字。
 """
 
@@ -186,7 +209,10 @@ class Summarizer:
 
     def summarize_document(self, doc: ExtractedDocument, repo_name: str) -> FeatureCard:
         """將單一 ExtractedDocument 轉為 FeatureCard。"""
-        prompt = USER_PROMPT_TEMPLATE.format(repo_name=repo_name, doc_text=doc.to_llm_text())
+        if doc.doc_type == "gdrive":
+            prompt = DRIVE_USER_PROMPT_TEMPLATE.format(doc_text=doc.to_llm_text())
+        else:
+            prompt = USER_PROMPT_TEMPLATE.format(repo_name=repo_name, doc_text=doc.to_llm_text())
         raw = self._call_llm(prompt)
         parsed = self._parse_json_response(raw)
 
@@ -200,8 +226,8 @@ class Summarizer:
             key_points = [str(p) for p in key_points_raw]
 
         source_ref = ""
-        if doc.doc_type == "pr":
-            source_ref = str(doc.metadata.get("url", ""))
+        if doc.doc_type in ("pr", "gdrive"):
+            source_ref = str(doc.metadata.get("url") or (doc.files[0] if doc.files else ""))
         elif doc.files:
             source_ref = doc.files[0]
 

@@ -137,6 +137,13 @@ class VectorStore:
         except Exception as exc:  # noqa: BLE001
             raise VectorStoreError(f"讀取向量資料庫筆數失敗：{exc}") from exc
 
+    def delete_by_doc_type(self, doc_type: str) -> None:
+        """刪除指定來源類型的所有卡片（例如同步前清掉舊的 Drive 卡片，再以快取內容重建）。"""
+        try:
+            self._collection.delete(where={"doc_type": doc_type})
+        except Exception as exc:  # noqa: BLE001
+            raise VectorStoreError(f"刪除向量資料庫中 {doc_type} 卡片失敗：{exc}") from exc
+
     def reset(self) -> None:
         """清空整個 collection（完整重新同步前使用）。"""
         try:

@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from openai import OpenAI
 
 from src import config
-from src.github_extractor import ExtractedDocument
+from src.documents import ExtractedDocument
 from src.rag_engine import RAGEngine, RAGEngineError
 from src.summarizer import Summarizer, SummarizerError
 from src.vector_store import VectorStore, VectorStoreError

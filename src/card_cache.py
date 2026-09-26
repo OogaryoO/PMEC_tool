@@ -15,19 +15,21 @@ GitHub repo，作為跨部署重啟的持久化儲存。
     - PR：一旦 merge 內容不會再變，用 `pr:<number>` 當作永久鍵。
     - README / API 規格：內容可能隨時間變動，用
       `<doc_type>:<path>:<內容雜湊>`，內容一變就視為新文件，重新摘要。
+    - Google Drive：`gdrive:<file_id>:<內容雜湊>`；同一檔案有新版本卡片後舊版本
+      即移除，檔案移出同步資料夾時（且掃描完整）亦移除。
 """
 from __future__ import annotations
 
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Set
 
 from github import Auth, Github
 from github.GithubException import GithubException, UnknownObjectException
 
 from src import config
-from src.github_extractor import ExtractedDocument
+from src.documents import ExtractedDocument
 
 logger = config.get_logger(__name__)
 
@@ -41,9 +43,52 @@ def doc_identity(doc: ExtractedDocument) -> str:
     if doc.doc_type == "pr":
         number = doc.metadata.get("number")
         return f"pr:{number}"
-    path = doc.files[0] if doc.files else doc.title
     content_hash = hashlib.sha256(doc.content.encode("utf-8")).hexdigest()[:16]
+    if doc.doc_type == "gdrive":
+        # Drive 檔案 ID 只含英數、`-`、`_`，不會與分隔用的冒號衝突
+        return f"gdrive:{doc.metadata['file_id']}:{content_hash}"
+    path = doc.files[0] if doc.files else doc.title
     return f"{doc.doc_type}:{path}:{content_hash}"
+
+
+def prune_gdrive_entries(
+    cache: Dict[str, dict],
+    current_docs: List[ExtractedDocument],
+    seen_file_ids: Set[str],
+    listing_complete: bool,
+) -> List[str]:
+    """就地刪除過期的 Drive 卡片，回傳被刪除的快取鍵。
+
+    對每個 `gdrive:` 開頭的快取鍵：
+        1. 是該檔案本次內容的鍵 → 保留。
+        2. 該檔案本次有新內容（舊版本）→ 新版本已成功摘要進快取才刪除；
+           新版摘要失敗則保留舊卡片，下次同步重試。
+        3. 本次有掃描到該檔案但沒有內容（讀取失敗／無文字／過大）→ 保留。
+        4. 其他（檔案已不在同步資料夾中）→ 只有掃描完整時才刪除，
+           避免權限暫時異常時誤刪、之後又得花 RAP 額度重新摘要。
+    非 `gdrive:` 開頭的鍵一律不動。
+    """
+    current_key_by_id = {
+        d.metadata["file_id"]: doc_identity(d) for d in current_docs if d.doc_type == "gdrive"
+    }
+    removed: List[str] = []
+    for key in list(cache):
+        if not key.startswith("gdrive:"):
+            continue
+        file_id = key.split(":", 2)[1]
+        current_key = current_key_by_id.get(file_id)
+        if key == current_key:
+            continue
+        if current_key is not None:
+            stale = current_key in cache
+        elif file_id in seen_file_ids:
+            stale = False
+        else:
+            stale = listing_complete
+        if stale:
+            del cache[key]
+            removed.append(key)
+    return removed
 
 
 @dataclass

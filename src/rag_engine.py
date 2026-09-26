@@ -28,7 +28,7 @@ class RAGEngineError(Exception):
 
 
 SYSTEM_PROMPT = (
-    "你是內部的「PM ↔ 工程對齊」助理。你的任務是根據『已檢索到的實際實作紀錄』，"
+    "你是內部的「PM ↔ 工程對齊」助理。你的任務是根據『已檢索到的實作紀錄與組織內部文件』，"
     "誠實評估目前系統是否能滿足 PM 或業務提出的客戶需求，禁止杜撰未在檢索資料中出現的功能。"
     "若檢索資料不足以判斷，必須明確說明資訊不足，而不是臆測。"
 )
@@ -37,7 +37,7 @@ USER_PROMPT_TEMPLATE = """\
 PM / 業務提出的商業問題：
 「{question}」
 
-以下是從 GitHub 知識庫（{repo_name}）檢索到的相關實作摘要（依相關度排序，可能包含不完全相關的結果）：
+以下是從組織知識庫（GitHub 倉庫 {repo_name} 的實作紀錄，以及 Google Drive 內部文件）檢索到的相關摘要（依相關度排序，可能包含不完全相關的結果）：
 ---
 {context}
 ---
@@ -52,6 +52,7 @@ PM / 業務提出的商業問題：
 注意：
 1. 若檢索到的資料與問題明顯無關或筆數為 0，【能否承諾客戶】必須填寫「目前無法」，並在其餘欄位說明「知識庫中尚無相關實作紀錄，需工程團隊確認」。
 2. 禁止引用檢索資料以外的功能或承諾。
+3. 每筆資料都標有來源類型；若「Google Drive 文件」與 GitHub 實作紀錄（README／API 規格／PR）內容衝突，以 GitHub 實作紀錄為準，並在【差距與風險（Gap Analysis）】中指出衝突。
 """
 
 SECTION_HEADERS = [
@@ -61,6 +62,13 @@ SECTION_HEADERS = [
     "建議對外溝通說法",
 ]
 
+SOURCE_TYPE_LABELS = {
+    "readme": "GitHub README",
+    "api_spec": "GitHub API 規格",
+    "pr": "GitHub PR",
+    "gdrive": "Google Drive 文件",
+}
+
 
 @dataclass
 class RetrievedCard:
@@ -69,6 +77,7 @@ class RetrievedCard:
     status: str
     source_title: str
     source_ref: str
+    doc_type: str
     distance: Optional[float]
 
 
@@ -127,6 +136,7 @@ class RAGEngine:
                     status=meta.get("status", ""),
                     source_title=meta.get("source_title", ""),
                     source_ref=meta.get("source_ref", ""),
+                    doc_type=meta.get("doc_type", ""),
                     distance=hit.get("distance"),
                 )
             )
@@ -143,6 +153,7 @@ class RAGEngine:
                 f"{idx}. 功能名稱：{c.feature_name}\n"
                 f"   商業場景支援：{c.business_scenario}\n"
                 f"   目前狀態：{c.status}\n"
+                f"   來源類型：{SOURCE_TYPE_LABELS.get(c.doc_type, c.doc_type or '未知')}\n"
                 f"   來源：{c.source_title}"
                 + (f" ({c.source_ref})" if c.source_ref else "")
             )

@@ -1,5 +1,5 @@
 """
-同步協調器：串接 GitHubExtractor → 功能卡片快取 (CardCache) →
+同步協調器：串接 GitHubExtractor / GDriveExtractor → 功能卡片快取 (CardCache) →
 Summarizer (RAP LLM) → VectorStore。
 
 設計目標：Streamlit Community Cloud 的檔案系統是 ephemeral，每次休眠喚醒或
@@ -7,7 +7,8 @@ Summarizer (RAP LLM) → VectorStore。
 文件重新呼叫 RAP LLM 摘要，會不必要地重複消耗國網 AI RAP 額度。
 
 流程：
-    1. 抓取 GitHub 上目前的 README / API 規格 / 近期已合併 PR（免費，PyGithub）。
+    1. 抓取 GitHub 上目前的 README / API 規格 / 近期已合併 PR（免費，PyGithub）；
+       若設定 GDRIVE_FOLDER_IDS，另抓取 Google Drive 資料夾（含子資料夾）文件。
     2. 讀取寫回 GitHub repo 的功能卡片快取（免費，PyGithub 讀檔；未設定
        `CACHE_REPO` 則略過，等同每次全量重新摘要）。
     3. 快取採「累積」策略：只對「快取中不存在」的文件（新 PR、或內容有變動
@@ -18,6 +19,9 @@ Summarizer (RAP LLM) → VectorStore。
        embedding 用 ChromaDB 內建免費模型，即使向量資料庫被 ephemeral
        環境清空，也能用快取零成本（不花 RAP 額度）重建。
     5. 若有新增摘要，才把合併後的快取寫回 GitHub，供下次啟動使用。
+
+Drive 卡片例外：同檔案只保留最新版本，檔案移出資料夾（掃描完整時）即自快取與
+ChromaDB 移除。
 """
 from __future__ import annotations
 
@@ -25,7 +29,8 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from src import config
-from src.card_cache import CardCache, CardCacheError, doc_identity
+from src.card_cache import CardCache, CardCacheError, doc_identity, prune_gdrive_entries
+from src.gdrive_extractor import GDriveExtractor, GDriveExtractorError, GDriveExtractResult
 from src.github_extractor import GitHubExtractor, GitHubExtractorError
 from src.summarizer import FeatureCard, Summarizer, SummarizerError
 from src.vector_store import VectorStore
@@ -41,6 +46,7 @@ class SyncResult:
     reused_count: int
     new_count: int
     failed_count: int
+    removed_count: int
     total_in_db: int
     cache_used: bool
     cache_warning: Optional[str] = None
@@ -53,13 +59,31 @@ def run_sync(vector_store: VectorStore, progress: Optional[ProgressFn] = None) -
         if progress:
             progress(msg)
 
-    config.require_valid(require_github=True, require_rap=True)
+    config.require_valid(require_github=True, require_rap=True, require_gdrive=config.GDRIVE_ENABLED)
 
     _report(f"連線 GitHub 並抓取 `{config.GITHUB_REPO}` 的 README / API 規格 / 近期已合併 PR ...")
     extractor = GitHubExtractor()
     docs = extractor.extract_all()
+    _report(f"GitHub：共抓取到 {len(docs)} 份原始文件。")
+
+    drive_result: Optional[GDriveExtractResult] = None
+    if config.GDRIVE_ENABLED:
+        _report(f"連線 Google Drive 並掃描 {len(config.GDRIVE_FOLDER_IDS)} 個資料夾（含子資料夾）...")
+        drive_result = GDriveExtractor().extract_all()
+        docs.extend(drive_result.docs)
+        _report(
+            f"Google Drive：共讀取 {len(drive_result.docs)} 份文件，"
+            f"略過 {len(drive_result.skipped)} 份（不支援的格式或無法讀取）。"
+        )
+        if not drive_result.complete:
+            _report(
+                f"⚠️ Google Drive 掃描未完整（已達 GDRIVE_MAX_FILES={config.GDRIVE_MAX_FILES} 上限或部分子資料夾讀取失敗），"
+                "本次不會移除已從 Drive 刪除的舊卡片。"
+            )
     if not docs:
-        raise GitHubExtractorError("未抓取到任何 README / API 規格 / 已合併 PR，請確認倉庫內容或權限設定。")
+        if drive_result is None:
+            raise GitHubExtractorError("未抓取到任何 README / API 規格 / 已合併 PR，請確認倉庫內容或權限設定。")
+        raise GDriveExtractorError("GitHub 與 Google Drive 皆未抓取到任何文件，請確認倉庫內容、資料夾內容與權限設定。")
     _report(f"共抓取到 {len(docs)} 份原始文件。")
 
     cache: dict = {}
@@ -112,16 +136,28 @@ def run_sync(vector_store: VectorStore, progress: Optional[ProgressFn] = None) -
 
     _report(f"成功新增 {new_count} 張功能卡片（{failed_count} 份文件摘要失敗已略過）。")
 
+    removed_count = 0
+    if drive_result is not None:
+        removed_keys = prune_gdrive_entries(
+            cache, drive_result.docs, drive_result.seen_file_ids, drive_result.complete
+        )
+        removed_count = len(removed_keys)
+        if removed_count:
+            _report(f"移除 {removed_count} 張過期（文件已更新）或已從 Drive 移除的卡片。")
+
     all_cards = [FeatureCard(**fields) for fields in cache.values()]
     if not all_cards:
         raise SummarizerError("目前沒有任何可用的功能卡片，且所有文件摘要皆失敗，請檢查 RAP 連線設定。")
 
     _report("寫入向量資料庫 (ChromaDB) ...")
+    if drive_result is not None:
+        # 先清掉 ChromaDB 中所有 Drive 卡片再以快取重建，讓已移除／過期的卡片不殘留
+        vector_store.delete_by_doc_type("gdrive")
     vector_store.upsert_cards(all_cards)
     total_in_db = vector_store.count()
     _report(f"目前資料庫共 {total_in_db} 筆功能卡片（快取累積總數 {len(all_cards)} 筆）。")
 
-    if card_cache is not None and new_count > 0:
+    if card_cache is not None and (new_count > 0 or removed_count > 0):
         try:
             card_cache.save(cache)
             _report("已將更新後的功能卡片快取寫回 GitHub。")
@@ -135,6 +171,7 @@ def run_sync(vector_store: VectorStore, progress: Optional[ProgressFn] = None) -
         reused_count=reused_count,
         new_count=new_count,
         failed_count=failed_count,
+        removed_count=removed_count,
         total_in_db=total_in_db,
         cache_used=cache_used and card_cache is not None,
         cache_warning=cache_warning,
