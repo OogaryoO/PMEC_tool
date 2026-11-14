@@ -106,6 +106,9 @@ def step3_rag_engine(card) -> None:
             metadata = {**card.to_metadata(), "kind": "card"}
             return [{"id": "check", "document": card.to_embedding_text(), "metadata": metadata, "distance": 0.0}]
 
+        def query_with_denied(self, query_text: str, top_k: int = 8, principals=None):
+            return self.query(query_text, top_k), 0
+
     try:
         engine = RAGEngine(index_store=_SingleCardIndex(), repo_name="example/example")
         answer = engine.answer("目前系統支援 CSV 批量匯入名單嗎？")
