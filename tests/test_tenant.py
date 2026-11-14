@@ -87,3 +87,11 @@ def test_action_stage_gate():
     check_action(TenantConfig(stage=4), "send_email", confirmed=True)
     with pytest.raises(ActionNotAllowed):
         check_action(TenantConfig(stage=3), "send_email", confirmed=True)
+
+
+def test_no_source_answer_detection():
+    from src.rag_engine import is_no_source_answer
+
+    assert is_no_source_answer("在你有權限查看的資料中找不到相關紀錄。 [1] [2]")
+    assert is_no_source_answer("沒有引用的回答")
+    assert not is_no_source_answer("單價 12,000 元 [1]")

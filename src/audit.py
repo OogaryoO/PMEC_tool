@@ -30,8 +30,11 @@ def record_question(
     denied_count: int,
     error: Optional[str] = None,
     action: str = "answer",
+    no_source: Optional[bool] = None,
 ) -> Optional[int]:
-    """寫入一筆操作紀錄，回傳 id。寫入失敗只記 log、回傳 None：紀錄失敗不應擋住員工使用。"""
+    """寫入一筆操作紀錄，回傳 id。寫入失敗只記 log、回傳 None：紀錄失敗不應擋住員工使用。
+    no_source：回答沒有引用任何資料（檢索一定會回傳最接近的幾筆，所以要看回答本身有沒有 [n]）；
+    未提供時以 source_ids 是否為空判斷。"""
     try:
         with engine.begin() as conn:
             return conn.execute(
@@ -48,7 +51,7 @@ def record_question(
                     "q": question,
                     "s": json.dumps(list(source_ids)),
                     "d": int(denied_count),
-                    "n": not source_ids,
+                    "n": (not source_ids) if no_source is None else bool(no_source),
                     "e": error,
                 },
             ).scalar_one()

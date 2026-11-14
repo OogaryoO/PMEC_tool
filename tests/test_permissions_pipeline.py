@@ -161,20 +161,21 @@ def test_audit_feedback_and_report(engine):
     a1 = audit.record_question(engine, "Amy@corp.com", "報價多少？", ["id1"], 0)
     a2 = audit.record_question(engine, "carl@corp.com", "薪資規定？", [], 2)
     audit.record_question(engine, "carl@corp.com", "壞掉的問題", [], 0, error="RAP 逾時")
+    audit.record_question(engine, "carl@corp.com", "有檢索但沒引用", ["id9"], 0, no_source=True)
     assert audit.record_feedback(engine, a1, "amy@corp.com", helpful=True)
     assert audit.record_feedback(engine, a2, "carl@corp.com", helpful=False, comment="找不到")
 
     report = audit.usage_report(engine, days=7)
-    assert report.questions == 3 and report.active_users == 2
+    assert report.questions == 4 and report.active_users == 2
     assert report.answered_with_sources == 1 and report.questions_with_denied == 1
     assert report.helpful_ratio == 0.5
     assert report.unhelpful_questions == ["薪資規定？"]
-    assert report.no_source_questions == ["薪資規定？"]
+    assert report.no_source_questions == ["有檢索但沒引用", "薪資規定？"]
     assert "50%" in report.to_markdown()
 
     future = dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=30)
     assert audit.usage_report(engine, days=7, now=future).questions == 0
-    assert audit.purge_old(engine, retention_days=0) == 3
+    assert audit.purge_old(engine, retention_days=0) == 4
 
 
 def test_connector_result_defaults():

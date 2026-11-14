@@ -17,7 +17,7 @@ from src.auth import Principal, authorize
 from src.config import ConfigError
 from src.db import get_engine
 from src.index_store import IndexStore, IndexStoreError
-from src.rag_engine import RAGAnswer, RAGEngine, RAGEngineError
+from src.rag_engine import RAGAnswer, RAGEngine, RAGEngineError, is_no_source_answer
 from src.tenant import TenantConfigError, get_tenant
 
 st.set_page_config(
@@ -294,7 +294,8 @@ if question:
                         question, history=history, principals=tenant.principals_for(principal.email)
                     )
                 audit_id = audit.record_question(
-                    get_engine(), principal.email, question, answer.source_ids, answer.denied_count
+                    get_engine(), principal.email, question, answer.source_ids, answer.denied_count,
+                    no_source=is_no_source_answer(answer.markdown),
                 )
                 render_answer(answer, audit_id)
                 st.session_state.messages.append(

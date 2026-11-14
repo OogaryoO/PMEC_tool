@@ -11,7 +11,7 @@
 | 企業設定檔（連接器、權限、排除、階段、紀錄保存） | `src/tenant.py`、`tenant.example.toml` | ✅ 可用，有測試 |
 | 連接器介面＋GitHub、Google Drive、共用資料夾／NAS | `src/connectors.py` | ✅ 可用；M365 只有介面 |
 | 檢索前依權限過濾；權限改變不重算向量 | `src/index_store.py`、`migrations/versions/0002_*` | ✅ 可用，有測試 |
-| Google Drive 沿用分享權限 | `src/gdrive_extractor.py` `drive_acl` | ⚠️ 已寫，**未在真的 Drive 測過**；Google 群組成員要手動列在 `[groups]` |
+| Google Drive 沿用分享權限 | `src/gdrive_extractor.py` `drive_acl` | ❌ 11-14 實測**拿不到**：服務帳號只有「檢視者」時，Google 不回傳分享設定（403 insufficientFilePermissions），程式自動改用路徑規則。要真的沿用，需改成下列其中一種（訪談 Q9 後決定）：①員工用自己的 Google 帳號授權、查詢時即時檢查（Grok 的做法）②Workspace 網域委派（domain-wide delegation）③服務帳號給「編輯者」（不建議） |
 | 排除規則（敏感資料不摘要、不索引，舊卡片也清掉） | `src/sync_pipeline.py` | ✅ 可用，有測試 |
 | 操作紀錄、回饋（有用／沒幫助）、週報、紀錄自動刪除 | `src/audit.py`、`python -m src.worker report／purge-audit` | ✅ 可用，有測試 |
 | 動作階段關卡（1 只讀～4 寄信，3、4 要逐次確認） | `src/actions.py` | ✅ 關卡可用；擬稿、改檔、寄信的實際動作**未做** |
@@ -54,6 +54,8 @@
 - NAS 的檔案系統權限（NTFS／POSIX ACL）不讀，用路徑規則代替。
 - Google 群組只換成 `group:<群組 email>`，成員要手動列在 `[groups]`（之後可串 Google Admin SDK）。
 - Drive 的共用雲端硬碟（Shared Drive）檔案，列表 API 通常不回傳分享設定 → 會改用路徑規則或預設值。
-- app.py 只做過語法檢查，還沒實際啟動 Streamlit 走一次提問→紀錄→回饋。
+- 11-14 已用 Streamlit AppTest 實際跑 app.py：沒權限的資料不會出現在回答、操作紀錄與回饋有寫入、週報正確（本機 dev 資料庫＋真的 RAP）。
+- 操作紀錄的「擋掉筆數」只看排名前 top_k 筆裡有幾筆沒權限，不判斷是否真的相關；資料量小時會偏高。
+- `.env` 的 RAP 模型 `Llama-3.1-405B-Instruct-FP8` 已下線（11-14）；目前 RAP 只列出 `Llama-3.3-70B-Instruct`。正式環境的 `RAP_MODEL_NAME` 也要確認。
 - `tenant.toml` 已列入 .gitignore；部署到 Cloud Run 時要另外放進映像或用 Secret 掛載（尚未處理）。
 - 網頁服務原本只能讀資料庫；現在可以「新增」操作紀錄與回饋（不能修改、不能刪除），刪除由背景工作做。

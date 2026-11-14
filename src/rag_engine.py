@@ -20,6 +20,16 @@ from src.index_store import IndexStore, IndexStoreError
 logger = config.get_logger(__name__)
 
 
+NOT_FOUND_PHRASE = "找不到相關紀錄"
+
+
+def is_no_source_answer(markdown: str) -> bool:
+    """回答沒有實際用到資料：沒有 [n] 引用，或明說找不到（模型偶爾會在找不到時仍標 [1]）。"""
+    import re
+
+    return NOT_FOUND_PHRASE in markdown or not re.search(r"\[\d+\]", markdown)
+
+
 class RAGEngineError(Exception):
     """檢索或生成回答失敗時拋出，訊息需可直接呈現給使用者。"""
 
@@ -45,7 +55,7 @@ SYSTEM_PROMPT_TEMPLATE = """\
 規則：
 1. 只能依據本輪提供的「檢索資料」與先前對話回答，禁止杜撰資料中沒有的功能、數字、時程或承諾。
 2. 檢索資料與問題無關或不足時，明確說明「在你有權限查看的資料中找不到相關紀錄」，可建議改問方向或需向哪個團隊確認；不要硬套不相關的資料。\
-查無紀錄不等於不支援：不可據此斷言「不支援」「尚未支援」，對外說法只能表達「需進一步確認」。
+此時不要標註任何來源編號。查無紀錄不等於不支援：不可據此斷言「不支援」「尚未支援」，對外說法只能表達「需進一步確認」。
 3. 使用資料時在句末以編號標註來源，例如 [1]、[2]，編號對應檢索資料的序號。
 4. Google Drive 文件與 GitHub 實作紀錄（README／API 規格／PR）內容衝突時，以 GitHub 實作紀錄為準並指出衝突。
 5. 以繁體中文、Markdown 回答；篇幅與問題複雜度相稱，簡單問題簡短回答，不要套用固定標題範本，不要使用程式碼區塊包住整段回答。
