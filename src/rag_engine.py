@@ -15,7 +15,7 @@ import openai
 from openai import OpenAI
 
 from src import config
-from src.vector_store import VectorStore, VectorStoreError
+from src.index_store import IndexStore, IndexStoreError
 
 logger = config.get_logger(__name__)
 
@@ -44,7 +44,7 @@ SYSTEM_PROMPT_TEMPLATE = """\
 
 規則：
 1. 只能依據本輪提供的「檢索資料」與先前對話回答，禁止杜撰資料中沒有的功能、數字、時程或承諾。
-2. 檢索資料與問題無關或不足時，明確說明「知識庫中找不到相關紀錄」，可建議改問方向或需向哪個團隊確認；不要硬套不相關的資料。\
+2. 檢索資料與問題無關或不足時，明確說明「在你有權限查看的資料中找不到相關紀錄」，可建議改問方向或需向哪個團隊確認；不要硬套不相關的資料。\
 查無紀錄不等於不支援：不可據此斷言「不支援」「尚未支援」，對外說法只能表達「需進一步確認」。
 3. 使用資料時在句末以編號標註來源，例如 [1]、[2]，編號對應檢索資料的序號。
 4. Google Drive 文件與 GitHub 實作紀錄（README／API 規格／PR）內容衝突時，以 GitHub 實作紀錄為準並指出衝突。
@@ -65,6 +65,8 @@ SOURCE_TYPE_LABELS = {
     "api_spec": "GitHub API 規格",
     "pr": "GitHub PR",
     "gdrive": "Google Drive 文件",
+    "fileshare": "公司共用資料夾文件",
+    "m365": "Microsoft 365 文件",
 }
 
 
@@ -87,21 +89,24 @@ class RAGAnswer:
     question: str
     markdown: str
     retrieved: List[RetrievedItem] = field(default_factory=list)
+    # 不看權限時會排進前幾名、但提問者沒權限的筆數；只寫進操作紀錄，是否顯示給員工由 tenant 設定決定
+    denied_count: int = 0
+    source_ids: List[str] = field(default_factory=list)
 
 
 class RAGEngine:
-    """組合 VectorStore 檢索與 RAP LLM 生成，依使用者意圖產出知識庫回答。"""
+    """組合 IndexStore 檢索與 RAP LLM 生成，依使用者意圖產出知識庫回答。"""
 
     def __init__(
         self,
-        vector_store: VectorStore,
+        index_store: IndexStore,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model_name: Optional[str] = None,
         repo_name: Optional[str] = None,
         top_k: Optional[int] = None,
     ) -> None:
-        self.vector_store = vector_store
+        self.index_store = index_store
         self.repo_name = repo_name or config.GITHUB_REPO or "未指定倉庫"
         self.top_k = top_k or config.RAG_TOP_K
 
@@ -122,10 +127,12 @@ class RAGEngine:
         self._system_prompt = SYSTEM_PROMPT_TEMPLATE.format(repo_name=self.repo_name)
 
     # ------------------------------------------------------------------
-    def _retrieve(self, query: str) -> List[RetrievedItem]:
+    def _retrieve(
+        self, query: str, principals: Optional[Sequence[str]] = None
+    ) -> Tuple[List[RetrievedItem], int, List[str]]:
         try:
-            hits = self.vector_store.query(query, top_k=self.top_k)
-        except VectorStoreError as exc:
+            hits, denied = self.index_store.query_with_denied(query, top_k=self.top_k, principals=principals)
+        except IndexStoreError as exc:
             raise RAGEngineError(str(exc)) from exc
 
         items: List[RetrievedItem] = []
@@ -149,7 +156,7 @@ class RAGEngine:
                     distance=hit.get("distance"),
                 )
             )
-        return items
+        return items, denied, [str(h.get("id")) for h in hits]
 
     @staticmethod
     def _build_context(items: List[RetrievedItem]) -> str:
@@ -201,10 +208,17 @@ class RAGEngine:
         return response.choices[0].message.content.strip()
 
     # ------------------------------------------------------------------
-    def answer(self, question: str, history: Sequence[Tuple[str, str]] = ()) -> RAGAnswer:
+    def answer(
+        self,
+        question: str,
+        history: Sequence[Tuple[str, str]] = (),
+        principals: Optional[Sequence[str]] = None,
+    ) -> RAGAnswer:
         """回答問題。
 
         history：先前的 (使用者問題, 助理回答) 配對，由舊到新；只取最後 MAX_HISTORY_TURNS 輪。
+        principals：提問者的主體（src/tenant.py principals_for）；只檢索他看得到的資料。
+        None＝不過濾，只給後台工具用，網頁一律要傳。
         """
         question = (question or "").strip()
         if not question:
@@ -214,7 +228,7 @@ class RAGEngine:
         # 追問（「那 P3 呢？」）單獨檢索會失去指涉對象，併入上一個問題一起檢索；
         # 本輪問題放前面，embedding 模型超過輸入上限時從尾端截斷
         query = f"{question}\n{recent[-1][0]}" if recent else question
-        items = self._retrieve(query)
+        items, denied, source_ids = self._retrieve(query, principals)
 
         messages: List[dict] = [{"role": "system", "content": self._system_prompt}]
         for past_question, past_answer in recent:
@@ -227,4 +241,10 @@ class RAGEngine:
             }
         )
 
-        return RAGAnswer(question=question, markdown=self._call_llm(messages), retrieved=items)
+        return RAGAnswer(
+            question=question,
+            markdown=self._call_llm(messages),
+            retrieved=items,
+            denied_count=denied,
+            source_ids=source_ids,
+        )

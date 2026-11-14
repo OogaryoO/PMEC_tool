@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from typing import Dict, Iterator, List
+from typing import Dict, Iterator, List, Optional
 
 from src.documents import ExtractedDocument
 
@@ -33,6 +33,8 @@ class Chunk:
     section: str
     text: str
     index: int
+    # 誰能看這段（主體字串，見 src/tenant.py）；None＝所有登入者。不影響 chunk_id，權限改變時不必重算向量
+    acl: Optional[List[str]] = None
 
     @property
     def chunk_id(self) -> str:

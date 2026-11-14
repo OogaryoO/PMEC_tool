@@ -1,44 +1,38 @@
 """
-同步協調器：串接 GitHubExtractor / GDriveExtractor → 功能卡片快取 (CardCache) →
-Summarizer (RAP LLM) → VectorStore。
-
-設計目標：Streamlit Community Cloud 的檔案系統是 ephemeral，每次休眠喚醒或
-重新部署都會清空本地的 `chroma_data/`。若同步流程每次都對「所有」抓到的
-文件重新呼叫 RAP LLM 摘要，會不必要地重複消耗國網 AI RAP 額度。
+同步協調器：串接連接器（src/connectors.py：GitHub、Google Drive、共用資料夾…）→ 功能卡片快取 (feature_cards) →
+Summarizer (RAP LLM) → IndexStore (pgvector)。每家企業用哪些連接器、權限與排除規則見 tenant.toml（src/tenant.py）。
 
 流程：
-    1. 抓取 GitHub 上目前的 README / API 規格 / 近期已合併 PR（免費，PyGithub）；
+    1. 抓取 GitHub 上目前的 README / API 規格 / 近期已合併 PR；
        若設定 GDRIVE_FOLDER_IDS，另抓取 Google Drive 資料夾（含子資料夾）文件。
-    2. 讀取寫回 GitHub repo 的功能卡片快取（免費，PyGithub 讀檔；未設定
-       `CACHE_REPO` 則略過，等同每次全量重新摘要）。
+    2. 讀取資料庫中的功能卡片快取。
     3. 快取採「累積」策略：只對「快取中不存在」的文件（新 PR、或內容有變動
        的 README/API 規格）呼叫 RAP LLM 摘要（唯一會消耗額度的步驟）；已存在
        的快取項目永久保留，即使該文件之後不在 GitHub 抓取的時間窗內
        （例如 PR_FETCH_LIMIT 之外的舊 PR），也不會遺失。
-    4. 把快取中「全部」卡片（含本次重用與新摘要）重新寫入 ChromaDB——
-       embedding 用本地免費 ONNX 模型，即使向量資料庫被 ephemeral
-       環境清空，也能用快取零成本（不花 RAP 額度）重建。
-    5. 把本次抓到的所有文件原文切段 (chunker) 寫入 ChromaDB，取代舊段落；
-       段落不經 RAP，每次都從來源重新產生，不寫入快取。
-    6. 若有新增摘要，才把合併後的快取寫回 GitHub，供下次啟動使用。
+    4. 新摘要先寫回快取，再更新檢索索引（索引寫入失敗也不會浪費已花的 RAP 額度）。
+    5. 索引中的卡片與原文段落以差異更新：只為新內容計算 embedding，移除已不存在的項目。
 
-Drive 卡片例外：同檔案只保留最新版本，檔案移出資料夾（掃描完整時）即自快取與
-ChromaDB 移除。
+Drive 卡片例外：同檔案只保留最新版本，檔案移出資料夾（掃描完整時）即自快取與索引移除。
+
+每次執行都記錄在 sync_runs 表，供網頁顯示上次同步結果。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+import json
+from dataclasses import asdict, dataclass
+from typing import Callable, Dict, List, Optional, Set, Tuple
+
+from sqlalchemy import Engine, text
 
 from src import config
-from src.card_cache import CardCache, CardCacheError, doc_identity, prune_gdrive_entries
-from src.chunker import chunk_document
-from src.config import ConfigError
-from src.documents import ExtractedDocument
-from src.gdrive_extractor import GDriveExtractor, GDriveExtractorError, GDriveExtractResult
-from src.github_extractor import GitHubExtractor, GitHubExtractorError
+from src.card_cache import doc_identity, drop_file_entries, load_cards, prune_file_entries, save_cards
+from src.chunker import chunk_document, source_ref_of
+from src.connectors import Connector, ConnectorError, ConnectorResult, build_connectors
+from src.documents import ExtractedDocument, source_path_of
+from src.index_store import IndexStore
 from src.summarizer import FeatureCard, Summarizer, SummarizerError
-from src.vector_store import VectorStore
+from src.tenant import TenantConfig, get_tenant
 
 logger = config.get_logger(__name__)
 
@@ -52,81 +46,78 @@ class SyncResult:
     new_count: int
     failed_count: int
     removed_count: int
+    card_count: int
     chunk_count: int
-    total_in_db: int
-    cache_used: bool
-    cache_warning: Optional[str] = None
+    embedded_count: int
+    excluded_count: int = 0
 
 
-def _extract_sources(report: ProgressFn) -> Tuple[List[ExtractedDocument], Optional[GDriveExtractResult]]:
-    """抓取 GitHub 與（有設定時）Google Drive 文件；全部為空時拋出對應例外。"""
-    report(f"連線 GitHub 並抓取 `{config.GITHUB_REPO}` 的 README / API 規格 / 近期已合併 PR ...")
-    docs = GitHubExtractor().extract_all()
-    report(f"GitHub：共抓取到 {len(docs)} 份原始文件。")
-
-    drive_result: Optional[GDriveExtractResult] = None
-    if config.GDRIVE_ENABLED:
-        report(f"連線 Google Drive 並掃描 {len(config.GDRIVE_FOLDER_IDS)} 個資料夾（含子資料夾）...")
-        drive_result = GDriveExtractor().extract_all()
-        docs.extend(drive_result.docs)
-        report(
-            f"Google Drive：共讀取 {len(drive_result.docs)} 份文件，"
-            f"略過 {len(drive_result.skipped)} 份（不支援的格式或無法讀取）。"
-        )
-        for path in drive_result.truncated:
+def _extract_sources(
+    connectors: List[Connector], tenant: TenantConfig, report: ProgressFn
+) -> Tuple[List[ExtractedDocument], List[ConnectorResult], Dict[str, Set[str]]]:
+    """逐一執行連接器；套用排除規則。回傳 (文件, 各連接器結果, {doc_type: 被排除的 file_id})。"""
+    docs: List[ExtractedDocument] = []
+    results: List[ConnectorResult] = []
+    excluded_ids: Dict[str, Set[str]] = {}
+    excluded_count = 0
+    for connector in connectors:
+        report(f"連線 {connector.describe()} 並抓取文件 ...")
+        result = connector.extract()
+        kept = []
+        for doc in result.docs:
+            if tenant.is_excluded(doc.source_path):
+                excluded_count += 1
+                if "file_id" in doc.metadata:
+                    excluded_ids.setdefault(doc.doc_type, set()).add(doc.metadata["file_id"])
+                continue
+            kept.append(doc)
+        result.docs = kept
+        results.append(result)
+        docs.extend(kept)
+        report(f"{connector.describe()}：讀取 {len(kept)} 份，略過 {len(result.skipped)} 份（不支援的格式或無法讀取）。")
+        for path in result.truncated:
             report(f"⚠️ 「{path}」內容過長，只收錄前段（超出部分無法被檢索）。")
-        if not drive_result.complete:
-            report(
-                f"⚠️ Google Drive 掃描未完整（已達 GDRIVE_MAX_FILES={config.GDRIVE_MAX_FILES} 上限或部分子資料夾讀取失敗），"
-                "本次不會移除已從 Drive 刪除的舊卡片。"
-            )
+        if not result.complete:
+            report(f"⚠️ {connector.describe()} 掃描未完整（達上限或部分資料夾讀取失敗），本次不會移除已刪除檔案的舊卡片。")
+    if excluded_count:
+        report(f"依 tenant.toml 的排除規則，丟棄 {excluded_count} 份文件（不摘要、不索引）。")
     if not docs:
-        if drive_result is None:
-            raise GitHubExtractorError("未抓取到任何 README / API 規格 / 已合併 PR，請確認倉庫內容或權限設定。")
-        raise GDriveExtractorError("GitHub 與 Google Drive 皆未抓取到任何文件，請確認倉庫內容、資料夾內容與權限設定。")
-    return docs, drive_result
+        raise ConnectorError("所有資料來源都沒有抓到文件，請確認來源內容、權限設定與排除規則。")
+    # PostgreSQL 的 text / jsonb 不接受 NUL 字元（部分 PDF、二進位誤判的檔案會帶有）
+    for doc in docs:
+        doc.title = doc.title.replace("\x00", "")
+        doc.content = doc.content.replace("\x00", "")
+        doc.files = [f.replace("\x00", "") for f in doc.files]
+    return docs, results, excluded_ids
 
 
-def _index_chunks(vector_store: VectorStore, docs: List[ExtractedDocument], report: ProgressFn) -> int:
-    chunks = [chunk for doc in docs for chunk in chunk_document(doc)]
-    report(f"將 {len(docs)} 份文件原文切成 {len(chunks)} 段並寫入向量資料庫（本地 embedding，不消耗 RAP）...")
-    return vector_store.replace_chunks(chunks)
-
-
-def run_sync(vector_store: VectorStore, progress: Optional[ProgressFn] = None) -> SyncResult:
-    """執行一次完整同步，回傳統計摘要。失敗時拋出對應例外，訊息可直接呈現給使用者。"""
+def run_sync(
+    engine: Engine,
+    index_store: IndexStore,
+    progress: Optional[ProgressFn] = None,
+    tenant: Optional[TenantConfig] = None,
+    connectors: Optional[List[Connector]] = None,
+    summarizer: Optional[Summarizer] = None,
+) -> SyncResult:
+    """執行一次完整同步，回傳統計摘要。失敗時拋出對應例外，訊息可直接呈現給使用者。
+    tenant／connectors／summarizer 預設由設定檔建立；測試時可注入。"""
 
     def _report(msg: str) -> None:
+        logger.info(msg)
         if progress:
             progress(msg)
 
-    config.require_valid(require_github=True, require_rap=True, require_gdrive=config.GDRIVE_ENABLED)
+    tenant = tenant or get_tenant()
+    if connectors is None:
+        connectors = build_connectors(tenant.connectors)
+    # engine 已由呼叫端建立，這裡不再檢查 DATABASE_URL
+    config.require_valid(require_github=False, require_rap=summarizer is None)
 
-    docs, drive_result = _extract_sources(_report)
+    docs, results, excluded_ids = _extract_sources(connectors, tenant, _report)
     _report(f"共抓取到 {len(docs)} 份原始文件。")
 
-    cache: dict = {}
-    cache_warning: Optional[str] = None
-    card_cache: Optional[CardCache] = None
-    cache_used = bool(config.CACHE_ENABLED and config.CACHE_REPO)
-
-    if cache_used:
-        try:
-            card_cache = CardCache(
-                repo_full_name=config.CACHE_REPO,
-                file_path=config.CACHE_FILE_PATH,
-                token=config.CACHE_GITHUB_TOKEN,
-                branch=config.CACHE_BRANCH,
-            )
-            cache = card_cache.load()
-            _report(f"讀取功能卡片快取（{config.CACHE_REPO}）：已有 {len(cache)} 筆先前摘要結果。")
-        except CardCacheError as exc:
-            cache_warning = f"讀取快取失敗，本次將重新摘要所有文件：{exc}"
-            logger.warning(cache_warning)
-            card_cache = None
-            cache = {}
-    else:
-        _report("未設定 CACHE_REPO，跳過快取（每次同步都會對所有文件重新呼叫 RAP LLM 摘要）。")
+    cache = load_cards(engine)
+    _report(f"讀取功能卡片快取：已有 {len(cache)} 筆先前摘要結果。")
 
     docs_to_summarize = [doc for doc in docs if doc_identity(doc) not in cache]
     reused_count = len(docs) - len(docs_to_summarize)
@@ -138,53 +129,69 @@ def run_sync(vector_store: VectorStore, progress: Optional[ProgressFn] = None) -
     new_count = 0
     failed_count = 0
     if docs_to_summarize:
-        summarizer = Summarizer()
+        summarizer = summarizer or Summarizer()
 
         def _progress(done: int, total: int, doc) -> None:
             _report(f"摘要進度 {done}/{total}：{doc.title[:40]}")
 
-        results = summarizer.summarize_batch(
+        results_ = summarizer.summarize_batch(
             docs_to_summarize, repo_name=config.GITHUB_REPO, progress_callback=_progress
         )
-        for doc, card in results:
+        for doc, card in results_:
             if card is None:
                 failed_count += 1
                 continue
             cache[doc_identity(doc)] = card.to_dict()
             new_count += 1
-
     _report(f"成功新增 {new_count} 張功能卡片（{failed_count} 份文件摘要失敗已略過）。")
 
     removed_count = 0
-    if drive_result is not None:
-        removed_keys = prune_gdrive_entries(
-            cache, drive_result.docs, drive_result.seen_file_ids, drive_result.complete
-        )
-        removed_count = len(removed_keys)
-        if removed_count:
-            _report(f"移除 {removed_count} 張過期（文件已更新）或已從 Drive 移除的卡片。")
+    for doc_type, ids in excluded_ids.items():
+        removed_count += len(drop_file_entries(cache, doc_type, ids))
+    for result in results:
+        if result.doc_type:
+            removed_count += len(
+                prune_file_entries(cache, result.docs, result.seen_file_ids, result.complete, doc_type=result.doc_type)
+            )
+    if removed_count:
+        _report(f"移除 {removed_count} 張過期（文件已更新、已刪除或被排除）的卡片。")
+
+    if not cache:
+        raise SummarizerError("目前沒有任何可用的功能卡片，且所有文件摘要皆失敗，請檢查 RAP 連線設定。")
+    save_cards(engine, cache)
+
+    # 權限：文件依 tenant 規則（或來源權限）決定 acl；卡片沿用同一份文件的 acl，
+    # 文件已不在本次抓取範圍（例如舊 PR）時依規則比對卡片的路徑
+    acl_by_ref = {}
+    chunks = []
+    for doc in docs:
+        acl = tenant.resolve_acl(doc.source_path, doc.source_acl)
+        acl_by_ref[(doc.doc_type, source_ref_of(doc))] = acl
+        for chunk in chunk_document(doc):
+            chunk.acl = acl
+            chunks.append(chunk)
+
+    def _card_acl(card: FeatureCard) -> List[str]:
+        found = acl_by_ref.get((card.doc_type, card.source_ref))
+        if found is not None:
+            return found
+        path = source_path_of(card.doc_type, card.files, card.source_title)
+        return tenant.resolve_acl(path)
 
     all_cards = [FeatureCard(**fields) for fields in cache.values()]
-    if not all_cards:
-        raise SummarizerError("目前沒有任何可用的功能卡片，且所有文件摘要皆失敗，請檢查 RAP 連線設定。")
-
-    _report("寫入向量資料庫 (ChromaDB) ...")
-    if drive_result is not None:
-        # 先清掉 ChromaDB 中所有 Drive 卡片再以快取重建，讓已移除／過期的卡片不殘留
-        vector_store.delete_by_doc_type("gdrive")
-    vector_store.upsert_cards(all_cards)
-    chunk_count = _index_chunks(vector_store, docs, _report)
-    total_in_db = vector_store.count()
-    _report(f"目前資料庫共 {total_in_db} 筆（功能卡片 {len(all_cards)} 張、原文段落 {chunk_count} 段）。")
-
-    if card_cache is not None and (new_count > 0 or removed_count > 0):
-        try:
-            card_cache.save(cache)
-            _report("已將更新後的功能卡片快取寫回 GitHub。")
-        except CardCacheError as exc:
-            warn = f"寫入快取失敗（不影響本次同步結果，但下次啟動可能需要重新摘要這批文件）：{exc}"
-            logger.warning(warn)
-            cache_warning = warn
+    # 卡片也要套排除規則（排除規則晚於快取建立時，舊卡片不能留在索引）
+    all_cards = [
+        c for c in all_cards if not tenant.is_excluded(source_path_of(c.doc_type, c.files, c.source_title))
+    ]
+    _report("更新檢索索引（本地 embedding，不消耗 RAP）...")
+    card_embedded, _ = index_store.sync_cards(all_cards, acl_for=_card_acl)
+    chunk_embedded, _ = index_store.sync_chunks(chunks)
+    chunk_count = index_store.count("chunk")
+    card_count = index_store.count("card")
+    _report(
+        f"索引共 {card_count + chunk_count} 筆（功能卡片 {card_count} 張、原文段落 {chunk_count} 段），"
+        f"本次重算向量 {card_embedded + chunk_embedded} 筆。"
+    )
 
     return SyncResult(
         doc_count=len(docs),
@@ -192,59 +199,48 @@ def run_sync(vector_store: VectorStore, progress: Optional[ProgressFn] = None) -
         new_count=new_count,
         failed_count=failed_count,
         removed_count=removed_count,
+        card_count=card_count,
         chunk_count=chunk_count,
-        total_in_db=total_in_db,
-        cache_used=cache_used and card_cache is not None,
-        cache_warning=cache_warning,
+        embedded_count=card_embedded + chunk_embedded,
+        excluded_count=sum(len(v) for v in excluded_ids.values()),
     )
 
 
-@dataclass
-class BootstrapResult:
-    card_count: int
-    chunk_count: int
-    total_in_db: int
-    chunk_warning: Optional[str] = None
-
-
-def bootstrap_from_cache(vector_store: VectorStore) -> Optional[BootstrapResult]:
-    """用 GitHub 上既有的功能卡片快取還原本地 ChromaDB，並重新抓取來源文件建立原文段落；
-    全程不呼叫 RAP LLM。用於 App 冷啟動時本地向量資料庫是空的（ephemeral 檔案系統重建、
-    首次啟動或更換 embedding 模型），讓使用者一進入頁面就能直接提問。
-
-    快取未啟用、未設定 CACHE_REPO、或快取內容目前是空的，回傳 None（呼叫端應提示
-    使用者改用「同步並更新」建立知識庫）。讀取快取失敗時拋出 CardCacheError。
-    抓取來源失敗不影響卡片還原，只回報於 chunk_warning。
-    """
-    if not (config.CACHE_ENABLED and config.CACHE_REPO):
-        return None
-
-    card_cache = CardCache(
-        repo_full_name=config.CACHE_REPO,
-        file_path=config.CACHE_FILE_PATH,
-        token=config.CACHE_GITHUB_TOKEN,
-        branch=config.CACHE_BRANCH,
-    )
-    cache = card_cache.load()
-    if not cache:
-        return None
-
-    all_cards = [FeatureCard(**fields) for fields in cache.values()]
-    vector_store.upsert_cards(all_cards)
-
-    chunk_count = 0
-    chunk_warning: Optional[str] = None
+def run_recorded_sync(
+    engine: Engine, index_store: IndexStore, trigger: str, progress: Optional[ProgressFn] = None
+) -> SyncResult:
+    """執行同步並把開始、結果或錯誤記錄到 sync_runs；例外照常往外拋。"""
+    with engine.begin() as conn:
+        run_id = conn.execute(
+            text("INSERT INTO sync_runs (trigger, status) VALUES (:t, 'running') RETURNING id"), {"t": trigger}
+        ).scalar_one()
     try:
-        config.require_valid(require_github=True, require_rap=False, require_gdrive=config.GDRIVE_ENABLED)
-        docs, _ = _extract_sources(logger.info)
-        chunk_count = _index_chunks(vector_store, docs, logger.info)
-    except (ConfigError, GitHubExtractorError, GDriveExtractorError) as exc:
-        chunk_warning = f"已從快取還原功能卡片，但抓取原文失敗，目前只能檢索卡片摘要：{exc}"
-        logger.warning(chunk_warning)
+        result = run_sync(engine, index_store, progress)
+    except Exception as exc:
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE sync_runs SET status = 'failed', finished_at = now(), error = :e WHERE id = :id"),
+                {"e": f"{type(exc).__name__}: {exc}", "id": run_id},
+            )
+        raise
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE sync_runs SET status = 'succeeded', finished_at = now(), "
+                "summary = CAST(:s AS jsonb) WHERE id = :id"
+            ),
+            {"s": json.dumps(asdict(result)), "id": run_id},
+        )
+    return result
 
-    return BootstrapResult(
-        card_count=len(all_cards),
-        chunk_count=chunk_count,
-        total_in_db=vector_store.count(),
-        chunk_warning=chunk_warning,
-    )
+
+def last_sync_run(engine: Engine) -> Optional[dict]:
+    """最近一次同步紀錄（含進行中），沒有紀錄則回傳 None。"""
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT trigger, status, started_at, finished_at, summary, error "
+                "FROM sync_runs ORDER BY id DESC LIMIT 1"
+            )
+        ).mappings().first()
+    return dict(row) if row else None

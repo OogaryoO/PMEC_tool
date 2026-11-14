@@ -1,6 +1,7 @@
 """
-透過 Google Drive API（Service Account 驗證）讀取指定資料夾（含所有子資料夾）內的文件，
-轉成與 GitHub 來源相同的 ExtractedDocument，供 summarizer.py 轉譯為「功能卡片」。
+透過 Google Drive API（Application Default Credentials：Cloud Run 上為服務掛載的 Service Account）
+讀取指定資料夾（含所有子資料夾）內的文件，轉成與 GitHub 來源相同的 ExtractedDocument，
+供 summarizer.py 轉譯為「功能卡片」。
 
 支援格式：
     - Google 文件 / 簡報（匯出純文字）、Google 試算表（匯出 xlsx，讀取所有工作表）
@@ -15,7 +16,6 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import io
-import json
 from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
@@ -23,8 +23,8 @@ import docx
 import openpyxl
 import pptx
 import pypdf
+import google.auth
 from google.auth.exceptions import GoogleAuthError
-from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -58,8 +58,33 @@ SUPPORTED_MIMES = set(GOOGLE_EXPORTS) | TEXT_MIMES | {PDF_MIME, DOCX_MIME, XLSX_
 # （documents.ExtractedDocument.to_llm_text）。上限只防止異常大檔拖垮記憶體與同步時間。
 MAX_TEXT_CHARS = 500_000
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
-LIST_FIELDS = "nextPageToken, files(id, name, mimeType, modifiedTime, size, webViewLink)"
+# permissions 只在呼叫者看得到分享設定時才會回傳（例如共用雲端硬碟的檔案通常沒有）；沒有時 source_acl=None，
+# 由 tenant.toml 的規則決定權限
+LIST_FIELDS = (
+    "nextPageToken, files(id, name, mimeType, modifiedTime, size, webViewLink, "
+    "permissions(type, emailAddress, domain))"
+)
 API_RETRIES = 3
+
+
+def drive_acl(item: dict) -> Optional[List[str]]:
+    """把 Drive 的分享設定換成主體字串（見 src/tenant.py）；沒有分享資訊時回傳 None。
+    限制：Google 群組只換成 "group:<群組 email>"，群組成員要在 tenant.toml [groups] 列出（尚未串 Admin SDK）。"""
+    perms = item.get("permissions")
+    if not perms:
+        return None
+    out: List[str] = []
+    for perm in perms:
+        kind = perm.get("type")
+        if kind == "anyone":
+            out.append("*")
+        elif kind == "domain" and perm.get("domain"):
+            out.append(f"domain:{perm['domain'].lower()}")
+        elif kind == "user" and perm.get("emailAddress"):
+            out.append(perm["emailAddress"].lower())
+        elif kind == "group" and perm.get("emailAddress"):
+            out.append(f"group:{perm['emailAddress'].lower()}")
+    return out or None
 
 
 class GDriveExtractorError(Exception):
@@ -220,35 +245,25 @@ class GDriveExtractor:
 
     def __init__(
         self,
-        credentials_json: Optional[str] = None,
         folder_ids: Optional[List[str]] = None,
         max_files: Optional[int] = None,
     ) -> None:
-        raw = (credentials_json or config.GDRIVE_SERVICE_ACCOUNT_JSON).strip()
         self.folder_ids = folder_ids or config.GDRIVE_FOLDER_IDS
         self.max_files = max_files or config.GDRIVE_MAX_FILES
 
-        if not raw:
-            raise GDriveExtractorError("GDRIVE_SERVICE_ACCOUNT_JSON 未設定，請在 .env 中設定 Service Account 金鑰。")
         if not self.folder_ids:
-            raise GDriveExtractorError("GDRIVE_FOLDER_IDS 未設定，請在 .env 中填入要同步的資料夾 ID。")
+            raise GDriveExtractorError("GDRIVE_FOLDER_IDS 未設定，請填入要同步的資料夾 ID。")
 
-        key_path = None if raw.startswith("{") else config.resolve_gdrive_credentials_path(raw)
         try:
-            info = json.loads(raw if key_path is None else key_path.read_text(encoding="utf-8"))
-            if not isinstance(info, dict):
-                raise ValueError("金鑰內容不是 JSON 物件")
-            creds = service_account.Credentials.from_service_account_info(info, scopes=DRIVE_SCOPES)
-        except FileNotFoundError as exc:
-            raise GDriveExtractorError(f"找不到 Service Account 金鑰檔：{key_path}") from exc
-        except OSError as exc:
-            raise GDriveExtractorError(f"無法讀取 Service Account 金鑰檔 {key_path}：{exc}") from exc
-        except (ValueError, KeyError) as exc:  # json.JSONDecodeError 是 ValueError 子類別
+            creds, _ = google.auth.default(scopes=DRIVE_SCOPES)
+        except GoogleAuthError as exc:
             raise GDriveExtractorError(
-                f"GDRIVE_SERVICE_ACCOUNT_JSON 不是合法的 Service Account 金鑰 JSON：{exc}"
+                "找不到 Google 憑證：Cloud Run 上請確認服務已掛載 Service Account；"
+                f"本機請設定 GOOGLE_APPLICATION_CREDENTIALS 指向金鑰檔。（{exc}）"
             ) from exc
 
-        self.service_account_email: str = creds.service_account_email
+        # Cloud Run 的 metadata 憑證在第一次取得 token 前 email 為 "default"
+        self.service_account_email: str = getattr(creds, "service_account_email", "") or "（未知帳號）"
         try:
             self._service = build("drive", "v3", credentials=creds, cache_discovery=False)
         except Exception as exc:  # noqa: BLE001
@@ -406,6 +421,7 @@ class GDriveExtractor:
                                 "modified_time": item.get("modifiedTime"),
                                 "url": item.get("webViewLink"),
                             },
+                            source_acl=drive_acl(item),
                         )
                     )
 

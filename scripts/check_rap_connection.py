@@ -12,17 +12,14 @@
     2. Summarizer 路徑：餵一份假造的 ExtractedDocument，跑過
        summarizer.py 的 prompt 組裝 -> 呼叫 LLM -> JSON 解析，確認
        「功能卡片摘要」這條路徑產出的物件欄位正確。
-    3. RAGEngine 路徑：用一個暫存目錄建立 VectorStore，塞入一張假卡片，
-       跑過 rag_engine.py 的檢索 -> 組 context -> 呼叫 LLM -> 區塊切段，
-       確認「PM 問答」這條路徑的四個區塊都能被正確解析出來。
+    3. RAGEngine 路徑：用只含這張假卡片的記憶體內檢索來源，跑過 rag_engine.py 的
+       組 context -> 呼叫 LLM，確認「PM 問答」這條路徑能產生回答。
 
-不需要真的連 GitHub，也不會動到 .env 指定的正式 CHROMA_PERSIST_DIR
-（VectorStore 會被導向一個臨時目錄）。會消耗少量 RAP 額度（三次 LLM 呼叫）。
+不需要連 GitHub，也不會讀寫資料庫。會消耗少量 RAP 額度（三次 LLM 呼叫）。
 """
 from __future__ import annotations
 
 import sys
-import tempfile
 import traceback
 from pathlib import Path
 
@@ -34,7 +31,6 @@ from src import config
 from src.documents import ExtractedDocument
 from src.rag_engine import RAGEngine, RAGEngineError
 from src.summarizer import Summarizer, SummarizerError
-from src.vector_store import VectorStore, VectorStoreError
 
 
 def _fail(step: str, exc: BaseException) -> None:
@@ -103,20 +99,20 @@ def step2_summarizer() -> None:
 
 def step3_rag_engine(card) -> None:
     print("=== 3/3 RAGEngine 路徑 (answer) ===")
-    with tempfile.TemporaryDirectory(prefix="pmec_rap_check_") as tmpdir:
-        try:
-            vs = VectorStore(persist_dir=tmpdir, collection_name="rap_check")
-            vs.upsert_cards([card])
-        except VectorStoreError as exc:
-            _fail("step3 VectorStore", exc)
+    class _SingleCardIndex:
+        """只回傳這張卡片的檢索來源，讓驗證不依賴資料庫。"""
 
-        try:
-            engine = RAGEngine(vector_store=vs, repo_name="example/example")
-            answer = engine.answer("目前系統支援 CSV 批量匯入名單嗎？")
-        except RAGEngineError as exc:
-            _fail("step3 RAGEngine", exc)
-        except Exception as exc:  # noqa: BLE001
-            _fail("step3 RAGEngine (未預期例外)", exc)
+        def query(self, query_text: str, top_k: int = 8):
+            metadata = {**card.to_metadata(), "kind": "card"}
+            return [{"id": "check", "document": card.to_embedding_text(), "metadata": metadata, "distance": 0.0}]
+
+    try:
+        engine = RAGEngine(index_store=_SingleCardIndex(), repo_name="example/example")
+        answer = engine.answer("目前系統支援 CSV 批量匯入名單嗎？")
+    except RAGEngineError as exc:
+        _fail("step3 RAGEngine", exc)
+    except Exception as exc:  # noqa: BLE001
+        _fail("step3 RAGEngine (未預期例外)", exc)
 
     print(f"    檢索到 {len(answer.retrieved)} 張卡片")
     print("    --- markdown ---")

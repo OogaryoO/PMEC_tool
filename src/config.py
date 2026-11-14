@@ -3,12 +3,13 @@
 
 所有需要密鑰 / 連線資訊的模組都應該從這裡讀取設定，
 而不是各自呼叫 os.getenv，避免設定分散、難以維護。
+
+本機開發讀取專案根目錄的 .env；部署在 Cloud Run 時由 Secret Manager 以環境變數注入。
 """
 from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
@@ -22,8 +23,8 @@ load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=False)
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 
 
@@ -34,6 +35,10 @@ def get_logger(name: str) -> logging.Logger:
 
 class ConfigError(Exception):
     """設定缺漏或不合法時拋出，訊息需可直接呈現給使用者。"""
+
+
+def _csv(name: str) -> List[str]:
+    return [s.strip() for s in os.getenv(name, "").split(",") if s.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -49,32 +54,33 @@ RAP_MODEL_NAME: str = os.getenv("RAP_MODEL_NAME", "Meta-Llama-3-70B-Instruct")
 GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
 GITHUB_REPO: str = os.getenv("GITHUB_REPO", "")  # 格式: owner/repo
 
-# --- ChromaDB ---
-CHROMA_PERSIST_DIR: str = os.getenv("CHROMA_PERSIST_DIR", "./chroma_data")
-CHROMA_COLLECTION_NAME: str = os.getenv("CHROMA_COLLECTION_NAME", "github_feature_cards")
-# fastembed 支援的 ONNX 模型；換模型後既有 collection 會自動清空，需從快取還原或重新同步。
+# --- 資料庫（PostgreSQL + pgvector） ---
+# SQLAlchemy URL，例如本機 postgresql+psycopg://user:pass@localhost/pmec；
+# Cloud Run 經 Cloud SQL 連線：postgresql+psycopg://user:pass@/pmec?host=/cloudsql/<project>:<region>:<instance>
+DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+# fastembed 支援的 ONNX 模型；更換後需執行 `python -m src.worker reembed` 重算向量。
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 
-# --- 功能卡片快取（寫回 GitHub repo，避免 ephemeral 部署環境重複消耗 RAP 額度） ---
-# CACHE_REPO 留空 = 停用快取，每次同步都會對所有抓到的文件重新呼叫 RAP LLM 摘要。
-CACHE_ENABLED: bool = os.getenv("CACHE_ENABLED", "true").strip().lower() in ("1", "true", "yes")
-CACHE_REPO: str = os.getenv("CACHE_REPO", "")
-CACHE_FILE_PATH: str = os.getenv("CACHE_FILE_PATH", "pmec_cache/feature_cards.json")
-CACHE_BRANCH: str = os.getenv("CACHE_BRANCH", "")  # 空字串 = 該 repo 的預設分支
-# 讀寫 CACHE_REPO 用的 token。刻意獨立於 GITHUB_TOKEN：GITHUB_TOKEN 只需對
-# GITHUB_REPO（V2 商業邏輯來源）有唯讀權限，但快取需要對 CACHE_REPO 有寫入權限；
-# 兩者權限範圍不同，不應共用同一把 token。留空則 fallback 回 GITHUB_TOKEN
-# （相容舊設定，但代表 GITHUB_TOKEN 需同時具備兩邊權限）。
-CACHE_GITHUB_TOKEN: str = os.getenv("CACHE_GITHUB_TOKEN", "") or GITHUB_TOKEN
-
 # --- Google Drive（選填：GDRIVE_FOLDER_IDS 有值即啟用） ---
-GDRIVE_FOLDER_IDS: List[str] = [
-    s.strip() for s in os.getenv("GDRIVE_FOLDER_IDS", "").split(",") if s.strip()
-]
-# Service Account 金鑰：JSON 檔路徑（相對路徑以 PROJECT_ROOT 為準），或直接貼上 JSON 內容（以 "{" 開頭）。
-GDRIVE_SERVICE_ACCOUNT_JSON: str = os.getenv("GDRIVE_SERVICE_ACCOUNT_JSON", "").strip()
+# 憑證採 Application Default Credentials：Cloud Run 上使用服務掛載的 Service Account；
+# 本機開發以 GOOGLE_APPLICATION_CREDENTIALS 指向金鑰檔，或 `gcloud auth application-default login`。
+GDRIVE_FOLDER_IDS: List[str] = _csv("GDRIVE_FOLDER_IDS")
 GDRIVE_MAX_FILES: int = int(os.getenv("GDRIVE_MAX_FILES", "100"))
 GDRIVE_ENABLED: bool = bool(GDRIVE_FOLDER_IDS)
+
+# --- 登入（Streamlit st.login + Google OIDC） ---
+ALLOWED_EMAIL_DOMAINS: List[str] = [d.lower() for d in _csv("ALLOWED_EMAIL_DOMAINS")]
+ADMIN_EMAILS: List[str] = [e.lower() for e in _csv("ADMIN_EMAILS")]
+# 僅供本機開發略過登入；在 Cloud Run（有 K_SERVICE 環境變數）上一律無效。
+RUNNING_ON_CLOUD_RUN: bool = bool(os.getenv("K_SERVICE"))
+AUTH_DISABLED: bool = (
+    os.getenv("AUTH_DISABLED", "").strip().lower() in ("1", "true", "yes") and not RUNNING_ON_CLOUD_RUN
+)
+
+# --- 同步工作（Cloud Run Job）；未設定時由管理員在頁面上直接執行同步（本機開發用） ---
+GCP_PROJECT: str = os.getenv("GCP_PROJECT", "")
+GCP_REGION: str = os.getenv("GCP_REGION", "asia-east1")
+SYNC_JOB_NAME: str = os.getenv("SYNC_JOB_NAME", "")
 
 # --- 其他可調參數 ---
 PR_FETCH_LIMIT: int = int(os.getenv("PR_FETCH_LIMIT", "20"))
@@ -83,39 +89,11 @@ LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.2"))
 LLM_REQUEST_TIMEOUT: float = float(os.getenv("LLM_REQUEST_TIMEOUT", "60"))
 
 
-@dataclass(frozen=True)
-class Settings:
-    """方便一次傳遞、單元測試時可覆寫的設定快照。"""
-
-    rap_api_key: str = RAP_API_KEY
-    rap_base_url: str = RAP_BASE_URL
-    rap_model_name: str = RAP_MODEL_NAME
-    github_token: str = GITHUB_TOKEN
-    github_repo: str = GITHUB_REPO
-    chroma_persist_dir: str = CHROMA_PERSIST_DIR
-    chroma_collection_name: str = CHROMA_COLLECTION_NAME
-    embedding_model: str = EMBEDDING_MODEL
-    cache_enabled: bool = CACHE_ENABLED
-    cache_repo: str = CACHE_REPO
-    cache_file_path: str = CACHE_FILE_PATH
-    cache_branch: str = CACHE_BRANCH
-    pr_fetch_limit: int = PR_FETCH_LIMIT
-    rag_top_k: int = RAG_TOP_K
-    llm_temperature: float = LLM_TEMPERATURE
-    llm_request_timeout: float = LLM_REQUEST_TIMEOUT
-
-
-def get_settings() -> Settings:
-    return Settings()
-
-
-def resolve_gdrive_credentials_path(raw: str) -> Path:
-    """GDRIVE_SERVICE_ACCOUNT_JSON 為檔案路徑時的實際位置；相對路徑以專案根目錄為準。"""
-    return PROJECT_ROOT / Path(raw).expanduser()
-
-
 def validate(
-    require_github: bool = True, require_rap: bool = True, require_gdrive: bool = False
+    require_github: bool = True,
+    require_rap: bool = True,
+    require_gdrive: bool = False,
+    require_database: bool = False,
 ) -> List[str]:
     """
     檢查必要設定是否齊全。
@@ -140,32 +118,30 @@ def validate(
         if not RAP_MODEL_NAME:
             missing.append("RAP_MODEL_NAME 未設定：請確認要使用的模型名稱。")
 
-    if require_gdrive:
-        if not GDRIVE_FOLDER_IDS:
-            missing.append(
-                "GDRIVE_FOLDER_IDS 未設定：請填入 Google Drive 資料夾 ID"
-                "（網址 https://drive.google.com/drive/folders/<ID> 的 <ID>），多個以逗號分隔。"
-            )
-        if not GDRIVE_SERVICE_ACCOUNT_JSON:
-            missing.append(
-                "GDRIVE_SERVICE_ACCOUNT_JSON 未設定：請填入 Service Account 金鑰 JSON 檔路徑，或直接貼上金鑰 JSON 內容。"
-            )
-        elif (
-            not GDRIVE_SERVICE_ACCOUNT_JSON.startswith("{")
-            and not resolve_gdrive_credentials_path(GDRIVE_SERVICE_ACCOUNT_JSON).is_file()
-        ):
-            missing.append(
-                "GDRIVE_SERVICE_ACCOUNT_JSON 指定的金鑰檔不存在："
-                f"{resolve_gdrive_credentials_path(GDRIVE_SERVICE_ACCOUNT_JSON)}"
-            )
+    if require_gdrive and not GDRIVE_FOLDER_IDS:
+        missing.append(
+            "GDRIVE_FOLDER_IDS 未設定：請填入 Google Drive 資料夾 ID"
+            "（網址 https://drive.google.com/drive/folders/<ID> 的 <ID>），多個以逗號分隔。"
+        )
+
+    if require_database and not DATABASE_URL:
+        missing.append("DATABASE_URL 未設定：請填入 PostgreSQL（需安裝 pgvector）的連線字串。")
 
     return missing
 
 
 def require_valid(
-    require_github: bool = True, require_rap: bool = True, require_gdrive: bool = False
+    require_github: bool = True,
+    require_rap: bool = True,
+    require_gdrive: bool = False,
+    require_database: bool = False,
 ) -> None:
     """設定不齊全時直接拋出 ConfigError，訊息可直接顯示給使用者。"""
-    missing = validate(require_github=require_github, require_rap=require_rap, require_gdrive=require_gdrive)
+    missing = validate(
+        require_github=require_github,
+        require_rap=require_rap,
+        require_gdrive=require_gdrive,
+        require_database=require_database,
+    )
     if missing:
-        raise ConfigError("設定不完整，請檢查 .env：\n- " + "\n- ".join(missing))
+        raise ConfigError("設定不完整，請檢查環境變數：\n- " + "\n- ".join(missing))

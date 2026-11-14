@@ -1,0 +1,12 @@
+.git
+.env
+.venv
+venv
+secrets
+chroma_data
+.dev_db
+.streamlit/secrets.toml
+**/__pycache__
+*.pyc
+tests
+deploy/deploy.env

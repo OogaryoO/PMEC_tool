@@ -1,0 +1,4 @@
+-r requirements.txt
+pytest>=8,<9
+# 測試用的內嵌 PostgreSQL（含 pgvector），不需要 Docker 或系統層級安裝
+pgserver>=0.1.4,<0.2

@@ -1,17 +1,17 @@
 """
-本地手動驗證腳本：確認 Google Drive 設定（Service Account 金鑰、資料夾共用權限）
+本地手動驗證腳本：確認 Google Drive 設定（Google 憑證、資料夾共用權限）
 真的能讀到 GDRIVE_FOLDER_IDS 指定資料夾（含子資料夾）內的文件。
 
 執行方式（在專案根目錄，venv 已啟用）：
     python scripts/check_gdrive_connection.py
 
 會依序：
-    1. 檢查 GDRIVE_FOLDER_IDS / GDRIVE_SERVICE_ACCOUNT_JSON 設定是否齊全。
-    2. 以 Service Account 金鑰建立 Drive 客戶端，印出 Service Account email
-       （資料夾必須共用給這個 email）。
+    1. 檢查 GDRIVE_FOLDER_IDS 設定是否齊全。
+    2. 以 Application Default Credentials 建立 Drive 客戶端（本機以 GOOGLE_APPLICATION_CREDENTIALS
+       指向 Service Account 金鑰檔），印出 Service Account email（資料夾必須共用給這個 email）。
     3. 掃描所有資料夾，逐份列出讀取到的文件與略過的檔案。
 
-不呼叫 RAP LLM、不讀寫功能卡片快取、不動 ChromaDB。
+不呼叫 RAP LLM、不讀寫資料庫。
 """
 from __future__ import annotations
 

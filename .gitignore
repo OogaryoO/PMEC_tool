@@ -5,3 +5,7 @@ chroma_data/
 __pycache__/
 *.pyc
 secrets/
+.streamlit/secrets.toml
+.dev_db/
+deploy/deploy.env
+tenant.toml

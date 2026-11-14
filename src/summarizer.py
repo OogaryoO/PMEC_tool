@@ -6,7 +6,7 @@
     - 商業場景支援 (business_scenario)
     - 目前狀態 (status)：已上線 / 開發中 / 限制
 
-輸出會被規格化成 FeatureCard，供 vector_store.py 入庫。
+輸出會被規格化成 FeatureCard，供 index_store.py 入庫。
 """
 from __future__ import annotations
 
@@ -99,7 +99,7 @@ class FeatureCard:
     files: List[str] = field(default_factory=list)
 
     def to_embedding_text(self) -> str:
-        """組合成適合做語意檢索的文字（存入 ChromaDB documents）。"""
+        """組合成適合做語意檢索的文字（存入檢索索引的 content）。"""
         points = "；".join(self.key_points) if self.key_points else ""
         return (
             f"功能名稱：{self.feature_name}\n"
@@ -110,7 +110,7 @@ class FeatureCard:
         )
 
     def to_metadata(self) -> Dict[str, str]:
-        """ChromaDB metadata 只接受純量型別，這裡統一轉成字串。"""
+        """metadata 統一轉成字串，方便檢索結果直接呈現。"""
         return {
             "feature_name": self.feature_name,
             "business_scenario": self.business_scenario,

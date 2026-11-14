@@ -1,25 +1,24 @@
 """
 Streamlit 前端：PMEC 知識庫助理。
 
-側邊欄：連線狀態、目標 Repo / Google Drive 資料夾、一鍵同步知識庫。
+登入：Google 帳號（st.login），僅限 ALLOWED_EMAIL_DOMAINS 的公司帳號。
+側邊欄：知識庫筆數；管理員另可看到連線設定、上次同步結果，並觸發同步。
 主畫面：多輪對話聊天介面，回答依問題意圖產生，並附上引用來源。
+權限：只檢索提問者看得到的資料（tenant.toml）；每次提問寫入操作紀錄，回答下方可按「有用／沒幫助」。
 """
 from __future__ import annotations
 
-import datetime as dt
 import traceback
 
 import streamlit as st
 
-from src import config
+from src import audit, config
+from src.auth import Principal, authorize
 from src.config import ConfigError
-from src.gdrive_extractor import GDriveExtractorError
-from src.github_extractor import GitHubExtractorError
+from src.db import get_engine
+from src.index_store import IndexStore, IndexStoreError
 from src.rag_engine import RAGAnswer, RAGEngine, RAGEngineError
-from src.summarizer import SummarizerError
-from src.card_cache import CardCacheError
-from src.sync_pipeline import bootstrap_from_cache, run_sync
-from src.vector_store import VectorStore, VectorStoreError
+from src.tenant import TenantConfigError, get_tenant
 
 st.set_page_config(
     page_title="PMEC 知識庫助理",
@@ -27,220 +26,177 @@ st.set_page_config(
     layout="wide",
 )
 
+
+# ---------------------------------------------------------------------------
+# 登入關卡
+# ---------------------------------------------------------------------------
+def require_login() -> Principal:
+    if config.AUTH_DISABLED:
+        return Principal(email="dev@localhost", name="本機開發", is_admin=True)
+
+    # 未設定 [auth] 時 st.user 沒有 is_logged_in 屬性，一律視為未登入
+    if not st.user.get("is_logged_in", False):
+        st.title("🧭 PMEC 知識庫助理")
+        st.write("請使用公司 Google 帳號登入。")
+        if st.button("使用 Google 帳號登入", type="primary"):
+            st.login()
+        st.stop()
+
+    principal = authorize(
+        email=st.user.get("email"),
+        email_verified=st.user.get("email_verified"),
+        name=st.user.get("name"),
+        allowed_domains=config.ALLOWED_EMAIL_DOMAINS,
+        admin_emails=config.ADMIN_EMAILS,
+    )
+    if principal is None:
+        st.error(f"帳號 {st.user.get('email')} 沒有使用權限，請改用公司 Google 帳號登入。")
+        if st.button("登出"):
+            st.logout()
+        st.stop()
+    return principal
+
+
+principal = require_login()
+
+try:
+    tenant = get_tenant()
+except TenantConfigError as exc:
+    st.error("系統設定有誤，請聯絡管理員。")
+    if principal.is_admin:
+        st.code(str(exc))
+    st.stop()
+
+
 # ---------------------------------------------------------------------------
 # Cached resources
 # ---------------------------------------------------------------------------
+@st.cache_resource(show_spinner=False)
+def get_index_store() -> IndexStore:
+    return IndexStore(get_engine())
 
 
 @st.cache_resource(show_spinner=False)
-def get_vector_store() -> VectorStore:
-    return VectorStore()
+def get_rag_engine(_index_store: IndexStore) -> RAGEngine:
+    return RAGEngine(index_store=_index_store)
 
 
-@st.cache_resource(show_spinner=False)
-def get_rag_engine(_vector_store: VectorStore) -> RAGEngine:
-    return RAGEngine(vector_store=_vector_store)
-
-
-def try_get_vector_store():
+def try_get_index_store():
     try:
-        return get_vector_store(), None
-    except VectorStoreError as exc:
+        return get_index_store(), None
+    except (ConfigError, IndexStoreError) as exc:
         return None, str(exc)
     except Exception as exc:  # noqa: BLE001
-        return None, f"向量資料庫初始化發生未預期錯誤：{exc}"
+        return None, f"資料庫初始化發生未預期錯誤：{exc}"
 
 
-def try_get_rag_engine(vector_store: VectorStore):
-    try:
-        return get_rag_engine(vector_store), None
-    except (RAGEngineError, ConfigError) as exc:
-        return None, str(exc)
-    except Exception as exc:  # noqa: BLE001
-        return None, f"RAG 引擎初始化發生未預期錯誤：{exc}"
-
-
-# ---------------------------------------------------------------------------
-# Session state
-# ---------------------------------------------------------------------------
 if "messages" not in st.session_state:
     st.session_state.messages = []  # list of dicts: role, content, answer(optional), error(optional)
-if "last_sync_info" not in st.session_state:
-    st.session_state.last_sync_info = None
 
 
 # ---------------------------------------------------------------------------
-# Sync pipeline: Extractor -> Summarizer -> VectorStore
+# 同步（僅管理員）
 # ---------------------------------------------------------------------------
-def run_sync_pipeline(vector_store: VectorStore) -> None:
+def start_sync(index_store: IndexStore) -> None:
+    if config.SYNC_JOB_NAME:
+        from src.jobs import JobTriggerError, trigger_sync_job
+
+        try:
+            trigger_sync_job()
+            st.success("已啟動背景同步工作，完成後重新整理頁面即可看到結果。")
+        except Exception as exc:  # noqa: BLE001 - 含 google.auth 錯誤
+            st.error(str(exc) if isinstance(exc, JobTriggerError) else f"觸發同步工作失敗：{exc}")
+        return
+
+    # 未設定 Cloud Run Job（本機開發）：直接在這個程序內同步
+    from src.sync_pipeline import run_recorded_sync
+
     with st.status("同步知識庫中...", expanded=True) as status:
         try:
-            def _progress(msg: str) -> None:
-                st.write(msg)
-
-            result = run_sync(vector_store, progress=_progress)
-
-            st.session_state.last_sync_info = {
-                "time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "doc_count": result.doc_count,
-                "reused_count": result.reused_count,
-                "new_count": result.new_count,
-                "failed_count": result.failed_count,
-                "removed_count": result.removed_count,
-                "chunk_count": result.chunk_count,
-                "total_in_db": result.total_in_db,
-                "cache_used": result.cache_used,
-            }
-            if result.cache_warning:
-                st.warning(result.cache_warning)
+            run_recorded_sync(get_engine(), index_store, trigger=f"web:{principal.email}", progress=st.write)
             status.update(label="✅ 同步完成！", state="complete")
-
-        except ConfigError as exc:
-            status.update(label="設定不完整，同步已中止。", state="error")
+        except Exception as exc:  # noqa: BLE001 - 錯誤已記錄在 sync_runs
+            status.update(label="同步失敗。", state="error")
             st.error(str(exc))
-        except GitHubExtractorError as exc:
-            status.update(label="GitHub 資料抓取失敗。", state="error")
-            st.error(str(exc))
-        except GDriveExtractorError as exc:
-            status.update(label="Google Drive 資料抓取失敗。", state="error")
-            st.error(str(exc))
-        except SummarizerError as exc:
-            status.update(label="LLM 摘要失敗。", state="error")
-            st.error(str(exc))
-        except VectorStoreError as exc:
-            status.update(label="向量資料庫寫入失敗。", state="error")
-            st.error(str(exc))
-        except Exception as exc:  # noqa: BLE001
-            status.update(label="發生未預期錯誤。", state="error")
-            st.error(f"同步過程發生未預期錯誤：{exc}")
             st.code(traceback.format_exc())
 
 
-# ---------------------------------------------------------------------------
-# Auto-bootstrap: 冷啟動時本地向量資料庫是空的，但 GitHub 快取可能已有先前累積的
-# 卡片；自動從快取還原，不呼叫 GitHub extractor、不呼叫 RAP LLM，讓使用者一進入
-# 頁面就能直接提問，不必手動點擊「同步並更新」並等待完整流程。
-# ---------------------------------------------------------------------------
-if "cache_bootstrap_attempted" not in st.session_state:
-    st.session_state.cache_bootstrap_attempted = False
-if "cache_bootstrap_warning" not in st.session_state:
-    st.session_state.cache_bootstrap_warning = None
+def render_admin_panel(index_store) -> None:
+    st.divider()
+    st.subheader("管理")
+    from src.connectors import ConnectorError, build_connectors
+    from src.tenant import STAGE_NAMES
 
-if not st.session_state.cache_bootstrap_attempted:
-    _bootstrap_vs, _bootstrap_vs_error = try_get_vector_store()
-    if not _bootstrap_vs_error:
+    st.markdown(f"**企業設定**：{tenant.name}；第 {tenant.stage} 階段（{STAGE_NAMES[tenant.stage]}）")
+    missing = config.validate(require_github=False, require_rap=True)
+    try:
+        st.markdown("**資料來源**：" + "、".join(c.describe() for c in build_connectors(tenant.connectors)))
+    except ConnectorError as exc:
+        missing.append(str(exc))
+    st.markdown(f"**RAP 模型**：`{config.RAP_MODEL_NAME or '（未設定）'}`")
+
+    for m in missing:
+        st.caption(f"⚠️ {m}")
+
+    if index_store is not None:
+        from src.sync_pipeline import last_sync_run
+
         try:
-            if _bootstrap_vs.count() == 0:
-                st.session_state.cache_bootstrap_attempted = True
-                with st.spinner("首次載入：從功能卡片快取還原知識庫，並重新抓取文件原文建立段落索引 ..."):
-                    _result = bootstrap_from_cache(_bootstrap_vs)
-                if _result:
-                    st.session_state.last_sync_info = {
-                        "time": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "doc_count": _result.card_count,
-                        "reused_count": _result.card_count,
-                        "new_count": 0,
-                        "failed_count": 0,
-                        "removed_count": 0,
-                        "chunk_count": _result.chunk_count,
-                        "total_in_db": _result.total_in_db,
-                        "cache_used": True,
-                    }
-                    st.session_state.cache_bootstrap_warning = _result.chunk_warning
-            else:
-                st.session_state.cache_bootstrap_attempted = True
-        except VectorStoreError:
-            pass  # 交由下方 Sidebar 區塊統一顯示向量資料庫錯誤
-        except CardCacheError as exc:
-            st.session_state.cache_bootstrap_attempted = True
-            st.session_state.cache_bootstrap_warning = f"自動從快取還原知識庫失敗：{exc}"
+            run = last_sync_run(get_engine())
+        except Exception as exc:  # noqa: BLE001
+            run = None
+            st.caption(f"⚠️ 讀取同步紀錄失敗：{exc}")
+        if run:
+            when = run["started_at"].astimezone().strftime("%Y-%m-%d %H:%M")
+            label = {"running": "進行中", "succeeded": "成功", "failed": "失敗"}[run["status"]]
+            st.caption(f"上次同步：{when}（{label}，{run['trigger']}）")
+            s = run["summary"] or {}
+            if s:
+                st.caption(
+                    f"抓取文件 {s['doc_count']} 份 → 重用快取 {s['reused_count']} 份／"
+                    f"新摘要 {s['new_count']} 份（{s['failed_count']} 份失敗）；"
+                    f"移除過期 Drive 卡片 {s['removed_count']} 張；重算向量 {s['embedded_count']} 筆"
+                )
+            if run["error"]:
+                st.caption(f"⚠️ {run['error']}")
+
+    if st.button("🔄 同步並更新知識庫", use_container_width=True, disabled=bool(missing or index_store is None)):
+        start_sync(index_store)
+
+    if index_store is not None:
+        with st.expander("📊 使用週報（最近 7 天）"):
+            try:
+                st.markdown(audit.usage_report(get_engine(), days=7).to_markdown())
+            except Exception as exc:  # noqa: BLE001
+                st.caption(f"⚠️ 讀取操作紀錄失敗（資料庫是否已執行 migrate？）：{exc}")
 
 
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
+index_store, store_error = try_get_index_store()
+
 with st.sidebar:
-    st.title("⚙️ 連線狀態")
+    st.markdown(f"👤 **{principal.name}**" + ("（管理員）" if principal.is_admin else ""))
+    if not config.AUTH_DISABLED and st.button("登出", use_container_width=True):
+        st.logout()
 
-    st.markdown(f"**目標 Repo**：`{config.GITHUB_REPO or '（未設定）'}`")
-    if config.GDRIVE_ENABLED:
-        st.markdown("**Google Drive 資料夾**：" + "、".join(f"`{fid}`" for fid in config.GDRIVE_FOLDER_IDS))
-    else:
-        st.markdown("**Google Drive 資料夾**：未設定（僅同步 GitHub）")
-    st.markdown(f"**RAP 模型**：`{config.RAP_MODEL_NAME or '（未設定）'}`")
-    st.markdown(f"**RAP 端點**：`{config.RAP_BASE_URL or '（未設定）'}`")
-    if config.CACHE_ENABLED and config.CACHE_REPO:
-        st.markdown(f"**功能卡片快取**：`{config.CACHE_REPO}` / `{config.CACHE_FILE_PATH}`")
-    else:
-        st.markdown("**功能卡片快取**：未啟用（每次同步都會重新呼叫 RAP LLM 摘要）")
-
-    if st.session_state.get("cache_bootstrap_warning"):
-        st.caption(
-            f"⚠️ {st.session_state.cache_bootstrap_warning}"
-            "（可手動點擊下方「同步並更新」重建知識庫）"
-        )
-
-    github_missing = config.validate(require_github=True, require_rap=False)
-    rap_missing = config.validate(require_github=False, require_rap=True)
-    gdrive_missing = (
-        config.validate(require_github=False, require_rap=False, require_gdrive=True)
-        if config.GDRIVE_ENABLED
-        else []
-    )
-
-    if not github_missing:
-        st.success("GitHub 設定完整")
-    else:
-        st.error("GitHub 設定不完整")
-        for m in github_missing:
-            st.caption(f"⚠️ {m}")
-
-    if not rap_missing:
-        st.success("RAP LLM 設定完整")
-    else:
-        st.error("RAP LLM 設定不完整")
-        for m in rap_missing:
-            st.caption(f"⚠️ {m}")
-
-    if config.GDRIVE_ENABLED:
-        if not gdrive_missing:
-            st.success("Google Drive 設定完整")
-        else:
-            st.error("Google Drive 設定不完整")
-            for m in gdrive_missing:
-                st.caption(f"⚠️ {m}")
-
-    st.divider()
-
-    vector_store, vs_error = try_get_vector_store()
-    if vs_error:
-        st.error(f"向量資料庫無法使用：{vs_error}")
+    if store_error:
+        st.error("知識庫目前無法使用，請聯絡管理員。")
+        if principal.is_admin:
+            st.caption(store_error)
     else:
         try:
             c1, c2 = st.columns(2)
-            c1.metric("功能卡片", vector_store.count("card"))
-            c2.metric("原文段落", vector_store.count("chunk"))
-        except VectorStoreError as exc:
-            st.error(str(exc))
+            c1.metric("功能卡片", index_store.count("card"))
+            c2.metric("原文段落", index_store.count("chunk"))
+        except IndexStoreError as exc:
+            st.error("讀取知識庫失敗，請聯絡管理員。")
+            if principal.is_admin:
+                st.caption(str(exc))
 
-    sync_disabled = bool(github_missing or rap_missing or gdrive_missing or vs_error)
-    if st.button("🔄 同步並更新知識庫", use_container_width=True, disabled=sync_disabled):
-        run_sync_pipeline(vector_store)
-
-    if sync_disabled and not vs_error:
-        st.caption("請先完成上方 GitHub / RAP / Google Drive 設定才能同步。")
-
-    if st.session_state.last_sync_info:
-        info = st.session_state.last_sync_info
-        st.caption(
-            f"上次同步：{info['time']}\n\n"
-            f"抓取文件 {info['doc_count']} 份 → 重用快取 {info['reused_count']} 份／"
-            f"新摘要 {info['new_count']} 份（{info['failed_count']} 份失敗）\n\n"
-            + (f"移除過期 Drive 卡片 {info['removed_count']} 張\n\n" if info.get("removed_count", 0) > 0 else "")
-            + f"原文段落 {info['chunk_count']} 段\n\n"
-            + f"資料庫目前共 {info['total_in_db']} 筆\n\n"
-            f"快取：{'已啟用' if info['cache_used'] else '未啟用'}"
-        )
+    if principal.is_admin:
+        render_admin_panel(index_store)
 
     st.divider()
     if st.button("🗑️ 清空對話紀錄", use_container_width=True):
@@ -258,12 +214,26 @@ st.caption(
 )
 
 
-def render_answer(answer: RAGAnswer) -> None:
+def render_feedback(audit_id) -> None:
+    """回答下方的「有用／沒幫助」：每則回答只記一次，是試點週報的成功指標。"""
+    if audit_id is None:
+        return
+    done = st.session_state.setdefault("feedback_done", set())
+    value = st.feedback("thumbs", key=f"fb_{audit_id}", disabled=audit_id in done)
+    if value is not None and audit_id not in done:
+        if audit.record_feedback(get_engine(), audit_id, principal.email, helpful=(value == 1)):
+            done.add(audit_id)
+            st.caption("已記錄，謝謝！")
+
+
+def render_answer(answer: RAGAnswer, audit_id=None) -> None:
     st.markdown(answer.markdown)
+    if tenant.reveal_denied_count_to_users and answer.denied_count:
+        st.caption(f"另有 {answer.denied_count} 筆相關資料你沒有權限查看；需要的話請向資料負責人申請。")
 
     with st.expander(f"🔍 參考資料（{len(answer.retrieved)} 筆）"):
         if not answer.retrieved:
-            st.caption("知識庫中查無相關資料，建議先執行「同步並更新知識庫」。")
+            st.caption("知識庫中查無相關資料。")
         for idx, item in enumerate(answer.retrieved, start=1):
             ref = item.source_ref
             source = f"[{item.source_title}]({ref})" if ref.startswith("http") else f"{item.source_title} {ref}".strip()
@@ -277,6 +247,7 @@ def render_answer(answer: RAGAnswer) -> None:
                     f"**[{idx}] {item.title}**（{item.status}）— {item.summary}"
                     f"\n\n來源：{source}"
                 )
+    render_feedback(audit_id)
 
 
 def build_history(messages: list) -> list:
@@ -288,12 +259,19 @@ def build_history(messages: list) -> list:
     return pairs
 
 
+def _fail(text: str, detail: str = "") -> None:
+    st.error(text)
+    if detail and principal.is_admin:
+        st.code(detail)
+    st.session_state.messages.append({"role": "assistant", "content": text, "error": True})
+
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         if msg.get("error"):
             st.error(msg["content"])
         elif msg.get("answer") is not None:
-            render_answer(msg["answer"])
+            render_answer(msg["answer"], msg.get("audit_id"))
         else:
             st.markdown(msg["content"])
 
@@ -306,26 +284,24 @@ if question:
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        if vs_error:
-            error_text = f"向量資料庫目前無法使用：{vs_error}"
-            st.error(error_text)
-            st.session_state.messages.append({"role": "assistant", "content": error_text, "error": True})
+        if store_error:
+            _fail("知識庫目前無法使用，請聯絡管理員。", store_error)
         else:
-            rag_engine, rag_error = try_get_rag_engine(vector_store)
-            if rag_error:
-                st.error(rag_error)
-                st.session_state.messages.append({"role": "assistant", "content": rag_error, "error": True})
-            else:
-                try:
-                    with st.spinner("檢索知識庫並產生回答中 ..."):
-                        answer = rag_engine.answer(question, history=history)
-                    render_answer(answer)
-                    st.session_state.messages.append({"role": "assistant", "content": answer.markdown, "answer": answer})
-                except RAGEngineError as exc:
-                    st.error(str(exc))
-                    st.session_state.messages.append({"role": "assistant", "content": str(exc), "error": True})
-                except Exception as exc:  # noqa: BLE001
-                    err_text = f"產生回答時發生未預期錯誤：{exc}"
-                    st.error(err_text)
-                    st.code(traceback.format_exc())
-                    st.session_state.messages.append({"role": "assistant", "content": err_text, "error": True})
+            try:
+                rag_engine = get_rag_engine(index_store)
+                with st.spinner("檢索知識庫並產生回答中 ..."):
+                    answer = rag_engine.answer(
+                        question, history=history, principals=tenant.principals_for(principal.email)
+                    )
+                audit_id = audit.record_question(
+                    get_engine(), principal.email, question, answer.source_ids, answer.denied_count
+                )
+                render_answer(answer, audit_id)
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": answer.markdown, "answer": answer, "audit_id": audit_id}
+                )
+            except (RAGEngineError, ConfigError) as exc:
+                audit.record_question(get_engine(), principal.email, question, [], 0, error=str(exc)[:500])
+                _fail(str(exc))
+            except Exception as exc:  # noqa: BLE001
+                _fail(f"產生回答時發生未預期錯誤：{exc}", traceback.format_exc())
