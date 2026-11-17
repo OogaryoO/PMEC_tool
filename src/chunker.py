@@ -86,7 +86,7 @@ def _pieces(line: str) -> Iterator[str]:
 
 def source_ref_of(doc: ExtractedDocument) -> str:
     """與 Summarizer 產生卡片時相同的來源參照：PR / Drive 用網址，其餘用檔案路徑。"""
-    if doc.doc_type in ("pr", "gdrive"):
+    if doc.doc_type in ("pr", "gdrive", "m365"):
         return str(doc.metadata.get("url") or (doc.files[0] if doc.files else ""))
     return doc.files[0] if doc.files else ""
 

@@ -27,7 +27,12 @@ root = "/mnt/nas/公司文件"
 max_files = 2000
 
 # [[connectors]]
-# type = "m365"              # Microsoft 365：尚未實作，訪談確認後做
+# type = "m365"              # Microsoft 365（SharePoint／OneDrive），Microsoft Graph；client secret 放 .env 的 M365_CLIENT_SECRET
+# name = "sharepoint"
+# tenant_id = "<Entra 租用戶 ID>"
+# client_id = "<應用程式 ID>"
+# drive_id = "<文件庫 drive ID>"
+# folder_path = "/共用文件/業務"   # 選填
 
 [permissions]
 # 沒有任何規則命中時誰能看（訪談 Q9）

@@ -14,8 +14,7 @@ tenant.toml 範例：
 tenant.toml 沒有 [[connectors]] 時，依 .env 決定（GITHUB_REPO 有值 → github；GDRIVE_FOLDER_IDS 有值 → gdrive），
 與加入本模組之前的行為相同。
 
-狀態：github、gdrive、fileshare 可用；m365 只有介面，等訪談確認企業用 Microsoft 365 後實作
-（見 docs/INTERVIEW_TO_CONFIG.md 第 7 題）。
+狀態：github、gdrive、fileshare、m365（Microsoft Graph）可用；m365 只有模擬測試，尚未用真的 Microsoft 365 租用戶測過。
 """
 from __future__ import annotations
 
@@ -203,22 +202,172 @@ class FileShareConnector(Connector):
 
 
 class M365Connector(Connector):
-    """Microsoft 365（SharePoint／OneDrive）——只有介面，尚未實作。
+    """Microsoft 365（SharePoint 文件庫／OneDrive）：用 Microsoft Graph 讀指定文件庫（可限定資料夾）。
 
-    實作計畫（訪談第 7 題答「Microsoft 365」才做，估 3～5 天）：
-      1. Entra ID 註冊應用程式，Graph 應用程式權限 Sites.Selected（只授權指定網站，最小權限）。
-      2. 用 Graph delta API 列出檔案（可增量同步），下載後重用 gdrive_extractor 的 docx/xlsx/pptx/pdf 解析。
-      3. 權限：GET /drives/{id}/items/{id}/permissions → 換成主體字串放 source_acl。
-      4. 參考：Grok 的 SharePoint 連接器也用 Sites.Selected（docs.x.ai/grok/connectors/sharepoint）。
+    tenant.toml：
+        [[connectors]]
+        type = "m365"
+        name = "sharepoint"          # 選填，路徑前綴（排除／權限規則用），預設 m365
+        tenant_id = "<Entra 租用戶 ID>"
+        client_id = "<應用程式（用戶端）ID>"
+        drive_id = "<文件庫的 drive ID>"
+        folder_path = "/共用文件/業務"   # 選填；不填＝整個文件庫
+        max_files = 2000
+    client secret 放 .env 的 M365_CLIENT_SECRET（不要寫進 tenant.toml）。
+
+    Entra 應用程式權限：建議 Sites.Selected（只授權指定網站，最小權限）；Files.Read.All 也可以但範圍是整個租用戶。
+    權限沿用（tenant.toml inherit_source_permissions = true）：讀每個檔案的 permissions，
+    使用者 email → 主體、群組 → group:<群組 email>；取不到時用 [permissions] 規則。
     """
 
     type = "m365"
+    GRAPH = "https://graph.microsoft.com/v1.0"
+    # 測試時換成 httpx.MockTransport
+    transport = None
+
+    def __init__(self, settings: Dict[str, Any]) -> None:
+        super().__init__(settings)
+        missing = [k for k in ("tenant_id", "client_id", "drive_id") if not settings.get(k)]
+        self.client_secret = settings.get("client_secret") or os.getenv("M365_CLIENT_SECRET", "")
+        if not self.client_secret:
+            missing.append("client_secret（.env 的 M365_CLIENT_SECRET）")
+        if missing:
+            raise ConnectorError(f"m365 連接器「{self.name}」缺少：{'、'.join(missing)}。")
+        self.drive_id = str(settings["drive_id"])
+        self.folder_path = "/" + str(settings.get("folder_path") or "").strip("/")
+        self.max_files = int(settings.get("max_files", 2000))
+        self.with_permissions = bool(settings.get("read_permissions", True))
+
+    def describe(self) -> str:
+        where = self.folder_path if self.folder_path != "/" else "整個文件庫"
+        return f"Microsoft 365「{self.name}」（{where}）"
+
+    # ------------------------------------------------------------------
+    def _client(self):
+        import httpx
+
+        token_url = f"https://login.microsoftonline.com/{self.settings['tenant_id']}/oauth2/v2.0/token"
+        with httpx.Client(transport=self.transport, timeout=30) as c:
+            r = c.post(token_url, data={
+                "grant_type": "client_credentials",
+                "client_id": self.settings["client_id"],
+                "client_secret": self.client_secret,
+                "scope": "https://graph.microsoft.com/.default",
+            })
+        if r.status_code != 200:
+            raise ConnectorError(f"Microsoft 365 取得存取權杖失敗（HTTP {r.status_code}）：請確認 tenant_id、client_id、client secret。")
+        return httpx.Client(
+            transport=self.transport, timeout=60, follow_redirects=True,
+            headers={"Authorization": f"Bearer {r.json()['access_token']}"},
+        )
+
+    def _get(self, client, url: str) -> dict:
+        r = client.get(url if url.startswith("http") else self.GRAPH + url)
+        if r.status_code == 404:
+            raise ConnectorError(f"Microsoft 365 找不到 `{url}`：請確認 drive_id／folder_path，並確認應用程式有這個網站的權限。")
+        if r.status_code in (401, 403):
+            raise ConnectorError(f"Microsoft 365 沒有權限讀取 `{url}`（HTTP {r.status_code}）：請在 Entra 授與 Sites.Selected 並指定這個網站。")
+        r.raise_for_status()
+        return r.json()
+
+    def _children(self, client, item_id: str):
+        url = f"/drives/{self.drive_id}/items/{item_id}/children?$top=200"
+        while url:
+            page = self._get(client, url)
+            yield from page.get("value", [])
+            url = page.get("@odata.nextLink")
+
+    def _acl(self, client, item_id: str) -> Optional[List[str]]:
+        try:
+            perms = self._get(client, f"/drives/{self.drive_id}/items/{item_id}/permissions").get("value", [])
+        except Exception:  # noqa: BLE001 - 權限讀不到就交給路徑規則
+            return None
+        out = set()
+        for p in perms:
+            identities = [p.get("grantedToV2") or {}] + list(p.get("grantedToIdentitiesV2") or [])
+            for ident in identities:
+                user = ident.get("user") or {}
+                group = ident.get("group") or ident.get("siteGroup") or {}
+                if user.get("email"):
+                    out.add(str(user["email"]).lower())
+                if group.get("email"):
+                    out.add("group:" + str(group["email"]).lower())
+        return sorted(out) or None
 
     def extract(self) -> ConnectorResult:
-        raise ConnectorError(
-            "Microsoft 365 連接器尚未實作（等訪談確認企業使用 Microsoft 365 後開發）；"
-            "請先從 tenant.toml 移除 type = \"m365\" 的連接器。"
-        )
+        from urllib.parse import quote
+
+        from src.gdrive_extractor import MAX_DOWNLOAD_BYTES, MAX_TEXT_CHARS
+
+        result = ConnectorResult(name=self.name, docs=[], doc_type="m365")
+        with self._client() as client:
+            root_url = (
+                f"/drives/{self.drive_id}/root" if self.folder_path == "/"
+                else f"/drives/{self.drive_id}/root:{quote(self.folder_path)}"
+            )
+            root = self._get(client, root_url)
+            stack = [(root["id"], "")]
+            while stack:
+                item_id, rel_dir = stack.pop()
+                try:
+                    children = list(self._children(client, item_id))
+                except ConnectorError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    result.complete = False
+                    result.skipped.append(f"{self.name}/{rel_dir}（資料夾讀取失敗：{exc}）")
+                    continue
+                for item in sorted(children, key=lambda i: i.get("name", "")):
+                    name = item.get("name", "")
+                    rel = f"{rel_dir}/{name}".lstrip("/")
+                    if "folder" in item:
+                        stack.append((item["id"], rel))
+                        continue
+                    if "file" not in item or name.startswith(("~$", ".")):
+                        continue
+                    logical = f"{self.name}/{rel}"
+                    parser = FileShareConnector._parser_for(Path(name).suffix)
+                    if parser is None:
+                        result.skipped.append(f"{logical}（不支援的格式）")
+                        continue
+                    if len(result.seen_file_ids) >= self.max_files:
+                        result.complete = False
+                        logger.warning("Microsoft 365「%s」已達 max_files=%d 上限，停止掃描。", self.name, self.max_files)
+                        stack.clear()
+                        break
+                    file_id = "m365:" + str(item["id"])
+                    result.seen_file_ids.add(file_id)
+                    if int(item.get("size") or 0) > MAX_DOWNLOAD_BYTES:
+                        result.skipped.append(f"{logical}（檔案超過 20MB）")
+                        continue
+                    try:
+                        r = client.get(f"{self.GRAPH}/drives/{self.drive_id}/items/{item['id']}/content")
+                        r.raise_for_status()
+                        text = parser(r.content).strip()
+                    except Exception as exc:  # noqa: BLE001
+                        result.skipped.append(f"{logical}（讀取失敗：{exc}）")
+                        continue
+                    if not text:
+                        result.skipped.append(f"{logical}（沒有可擷取的文字，可能是掃描影像）")
+                        continue
+                    if len(text) >= MAX_TEXT_CHARS:
+                        result.truncated.append(logical)
+                    result.docs.append(
+                        ExtractedDocument(
+                            doc_type="m365",
+                            title=f"Microsoft 365 文件：{logical}",
+                            content=text[:MAX_TEXT_CHARS],
+                            files=[logical],
+                            metadata={
+                                "file_id": file_id,
+                                "modified_time": item.get("lastModifiedDateTime", ""),
+                                "url": item.get("webUrl", ""),
+                            },
+                            source_acl=self._acl(client, item["id"]) if self.with_permissions else None,
+                        )
+                    )
+        logger.info("Microsoft 365「%s」：讀取 %d 份、略過 %d 份。", self.name, len(result.docs), len(result.skipped))
+        return result
 
 
 REGISTRY: Dict[str, type] = {

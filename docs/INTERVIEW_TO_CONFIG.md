@@ -9,7 +9,7 @@
 | 模組 | 檔案 | 狀態 |
 |---|---|---|
 | 企業設定檔（連接器、權限、排除、階段、紀錄保存） | `src/tenant.py`、`tenant.example.toml` | ✅ 可用，有測試 |
-| 連接器介面＋GitHub、Google Drive、共用資料夾／NAS | `src/connectors.py` | ✅ 可用；M365 只有介面 |
+| 連接器介面＋GitHub、Google Drive、共用資料夾／NAS、Microsoft 365 | `src/connectors.py` | ✅ 可用；M365 只用模擬的 Graph 測過（2026-11-17），未接真的租用戶 |
 | 檢索前依權限過濾；權限改變不重算向量 | `src/index_store.py`、`migrations/versions/0002_*` | ✅ 可用，有測試 |
 | Google Drive 沿用分享權限 | `src/gdrive_extractor.py` `drive_acl` | ❌ 11-14 實測**拿不到**：服務帳號只有「檢視者」時，Google 不回傳分享設定（403 insufficientFilePermissions），程式自動改用路徑規則。要真的沿用，需改成下列其中一種（訪談 Q9 後決定）：①員工用自己的 Google 帳號授權、查詢時即時檢查（Grok 的做法）②Workspace 網域委派（domain-wide delegation）③服務帳號給「編輯者」（不建議） |
 | 排除規則（敏感資料不摘要、不索引，舊卡片也清掉） | `src/sync_pipeline.py` | ✅ 可用，有測試 |

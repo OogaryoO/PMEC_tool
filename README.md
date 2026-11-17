@@ -5,7 +5,21 @@
 助理先判斷問題意圖（事實查詢、進度狀態、操作說明、彙整比較、對客戶承諾評估、閒聊），
 再依意圖產生回答並標註引用來源。
 
-部署在 Google Cloud（Cloud Run + Cloud SQL），僅限公司 Google 帳號登入。
+可以裝在四種環境（導入手冊的「套餐」）：
+- **試用版**：公司一台常開的電腦／NAS，`docker compose up -d`（沒有 Docker 的 Linux／WSL：`bash scripts/local_stack.sh`）
+- **地端版**：同上，再加 `--profile ollama` 跑地端模型，資料不出公司
+- **雲端版**：Google Cloud Run＋外部 PostgreSQL（例如 Neon 免費方案），`deploy/deploy.env` 設 `DB_MODE=external`
+- **企業雲版**：Google Cloud Run＋Cloud SQL（`DB_MODE=cloudsql`）
+
+AI 模型由客戶自選（國網 RAP、OpenAI、Anthropic Claude、OpenRouter、Gemini、Ollama 或任何 OpenAI 相容端點，見 `src/llm.py`）。
+登入：Google、Microsoft Entra ID（單一租用戶），或 Cloudflare Access（email 驗證碼，驗證簽章後才信任）。
+
+## 快速開始（新客戶）
+
+```bash
+python -m src.setup_wizard     # 回答問題 → 產生 tenant.toml、.env、.streamlit/secrets.toml（雲端版另有 deploy/deploy.env）
+docker compose up -d --build   # 或 bash scripts/local_stack.sh；雲端版：bash deploy/gcp_setup.sh && bash deploy/deploy.sh
+```
 
 ## 架構
 
@@ -19,20 +33,24 @@ project-root/
 │   ├── documents.py          # 各來源共用的原始文件結構 ExtractedDocument
 │   ├── github_extractor.py   # 透過 PyGithub 抓取 README、API 規格、近期 Merged PR
 │   ├── gdrive_extractor.py   # 透過 Google Drive API 讀取指定資料夾（含子資料夾）文件
-│   ├── card_cache.py         # 功能卡片快取（feature_cards 表），避免重複消耗 RAP 額度
-│   ├── summarizer.py         # 呼叫 RAP LLM 將 Raw Code/PR/文件轉譯為功能卡片
+│   ├── card_cache.py         # 功能卡片快取（feature_cards 表），避免重複消耗 AI 模型額度
+│   ├── summarizer.py         # 呼叫 AI 模型將 Raw Code/PR/文件轉譯為功能卡片
 │   ├── chunker.py            # 把文件原文切成段落（試算表逐列保留欄名），供細節檢索
 │   ├── index_store.py        # pgvector 檢索索引 + 本地多語 ONNX Embedding（fastembed）
 │   ├── sync_pipeline.py      # 抓取 → 快取 → 摘要 → 索引的同步協調器，記錄於 sync_runs
 │   ├── rag_engine.py         # 檢索卡片與原文段落，依問題意圖產生回答
 │   ├── jobs.py               # 從網頁觸發 Cloud Run 同步工作
+│   ├── llm.py / llm_anthropic.py  # 客戶自選的 AI 模型（OpenAI 相容＋Anthropic 官方 SDK）
+│   ├── scheduler.py          # 非 Google Cloud 環境的排程：網頁同步請求＋每日同步
+│   ├── cf_access.py          # 驗證 Cloudflare Access 登入憑證（AUTH_MODE=cloudflare）
+│   ├── setup_wizard.py       # 安裝精靈
 │   └── worker.py             # 背景工作入口：migrate / sync / reembed
 ├── migrations/               # Alembic schema 版本
 ├── deploy/                   # GCP 一次性建置（gcp_setup.sh）與部署（deploy.sh）
 ├── scripts/
 │   ├── dev_db.py                   # 本機啟動內嵌 PostgreSQL（含 pgvector）
 │   ├── migrate_card_cache.py       # 一次性：把舊版 GitHub 上的卡片快取匯入資料庫
-│   ├── check_rap_connection.py     # 手動驗證 RAP LLM 連線
+│   ├── check_llm_connection.py     # 手動驗證 AI 模型連線
 │   └── check_gdrive_connection.py  # 手動驗證 Google Drive 憑證與資料夾權限
 └── tests/
 ```
@@ -46,8 +64,8 @@ flowchart LR
     WEB -->|管理員按同步| JOB[Cloud Run Job: pmec-sync]
     SCH[Cloud Scheduler 每日] --> JOB
     JOB -->|pmec_worker| DB
-    JOB --> GH[GitHub] & GD[Google Drive] & RAP[RAP LLM]
-    WEB --> RAP
+    JOB --> GH[GitHub] & GD[Google Drive] & LLM[AI 模型]
+    WEB --> LLM
 ```
 
 ### 資料流
@@ -58,21 +76,21 @@ flowchart LR
     J[Google Drive 資料夾] --> K[gdrive_extractor]
     B & K --> Z{feature_cards 有嗎？}
     Z -->|有：直接重用| D[功能卡片]
-    Z -->|沒有：呼叫 RAP| C[summarizer] --> D
+    Z -->|沒有：呼叫 AI 模型| C[summarizer] --> D
     D -->|寫回快取| Z
     B & K --> CH[chunker]
     D & CH -->|只為新內容算 embedding| E[(retrieval_items)]
     F[使用者提問 + 先前對話] --> G[rag_engine]
-    E -->|相似度檢索| G -->|RAP LLM 生成| H[回答 + 引用來源]
+    E -->|相似度檢索| G -->|AI 模型生成| H[回答 + 引用來源]
 ```
 
-會消耗國網 AI RAP 額度的只有 `summarizer`（新文件的功能卡片）與 `rag_engine`（生成回答）；
+會呼叫 AI 模型（花額度）的只有 `summarizer`（新文件的功能卡片，送文件前 6,000 字）與 `rag_engine`（生成回答，送相關段落）；
 embedding 在服務內以 ONNX 模型計算，文字不送往第三方。
 
 ## 企業設定（tenant.toml）與權限
 
 每家導入企業的差異只放在 `tenant.toml`（範例：`tenant.example.toml`；路徑可用 `TENANT_CONFIG` 指定）：
-資料來源連接器（GitHub、Google Drive、公司共用資料夾／NAS；Microsoft 365 只有介面）、
+資料來源連接器（GitHub、Google Drive、公司共用資料夾／NAS、Microsoft 365）、
 誰能看哪些資料、哪些資料一律不收、助理開放到哪個階段（1 只讀～4 寄信）、操作紀錄保存天數。
 沒有這個檔案時，行為與先前相同（所有登入者看得到所有資料、只讀、來源依 `.env`）。
 
@@ -86,7 +104,7 @@ embedding 在服務內以 ONNX 模型計算，文字不送往第三方。
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
-cp .env.example .env              # 填入 RAP、GitHub、Drive 設定
+cp .env.example .env              # 填入 AI 模型、GitHub、Drive 設定（或用 python -m src.setup_wizard）
 python scripts/dev_db.py          # 啟動內嵌 PostgreSQL，把印出的 DATABASE_URL 填入 .env
 python -m src.worker sync         # 第一次同步（或先用 migrate_card_cache.py 匯入舊快取）
 streamlit run app.py              # .env 設 AUTH_DISABLED=true 可略過登入
@@ -100,7 +118,12 @@ OAuth 用戶端，`.env` 設 `AUTH_DISABLED=false`。
 
 | 變數 | 說明 |
 | --- | --- |
-| `RAP_API_KEY` / `RAP_BASE_URL` / `RAP_MODEL_NAME` | 國網 RAP 平台（任何相容 OpenAI SDK 的端點皆可） |
+| `LLM_PROVIDER` / `LLM_MODEL` / `LLM_API_KEY` / `LLM_BASE_URL` | AI 模型（`rap`、`openai`、`anthropic`、`openrouter`、`gemini`、`ollama`、`custom`）；舊的 `RAP_*` 仍可用。驗證：`python scripts/check_llm_connection.py` |
+| `AUTH_MODE` | `google`（預設）、`microsoft`（需 `ENTRA_TENANT_ID`）、`cloudflare`（需 `CF_ACCESS_TEAM_DOMAIN`、`CF_ACCESS_AUD`） |
+| `ALLOWED_EMAILS` | 個別允許的 email（和 `ALLOWED_EMAIL_DOMAINS` 擇一或並用） |
+| `SYNC_MODE` | 網頁同步按鈕：`cloudrun`、`queue`（交給 `python -m src.worker scheduler`）、`inline`（單機開發） |
+| `SYNC_DAILY_AT` / `SYNC_TIMEZONE` | scheduler 的每日同步時間（預設 03:00、Asia/Taipei；空字串＝關閉） |
+| `M365_CLIENT_SECRET` | Microsoft 365 連接器的 client secret |
 | `GITHUB_TOKEN` / `GITHUB_REPO` | 目標倉庫（`owner/repo`）與唯讀 token |
 | `DATABASE_URL` | PostgreSQL（需 pgvector）的 SQLAlchemy 連線字串 |
 | `EMBEDDING_MODEL` | 選填，fastembed 支援的 384 維 ONNX 模型；更換後執行 `python -m src.worker reembed` |
@@ -141,7 +164,7 @@ docx / xlsx / pptx；其餘格式略過。每份文件產生兩種知識：
 ## 常見問題
 
 - **GitHub Token 無效 / 403**：確認 Token 未過期，且具備目標私有倉庫的讀取權限。
-- **RAP 連線失敗**：確認 `RAP_BASE_URL`、`RAP_API_KEY`、`RAP_MODEL_NAME`，可執行 `python scripts/check_rap_connection.py`。
+- **AI 模型連線失敗**：確認 `LLM_PROVIDER`、`LLM_MODEL`、`LLM_API_KEY`（或舊的 `RAP_*`），執行 `python scripts/check_llm_connection.py`。
 - **同步後知識庫仍為 0 筆**：可能該倉庫沒有 README、常見路徑找不到 API 規格檔，或近期沒有已合併的 PR；可調整 `src/github_extractor.py` 中的候選路徑清單。
 - **Google Drive 顯示「找不到資料夾」/ 403**：確認資料夾已分享給同步工作的 Service Account（`scripts/check_gdrive_connection.py` 會印出），且專案已啟用 Google Drive API。
 - **Drive 同步提示「掃描未完整」**：已達 `GDRIVE_MAX_FILES` 上限或有子資料夾讀取失敗；此時不會移除已從 Drive 刪除的舊卡片，避免誤刪後重新摘要浪費 RAP 額度。

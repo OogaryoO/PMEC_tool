@@ -18,7 +18,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 from src import config
 from src.llm import LLMClient, LLMError
 from src.chunker import source_ref_of
-from src.documents import ExtractedDocument
+from src.documents import FILE_DOC_TYPES, ExtractedDocument
 
 logger = config.get_logger(__name__)
 
@@ -163,7 +163,7 @@ class Summarizer:
 
     def summarize_document(self, doc: ExtractedDocument, repo_name: str) -> FeatureCard:
         """將單一 ExtractedDocument 轉為 FeatureCard。"""
-        if doc.doc_type == "gdrive":
+        if doc.doc_type in FILE_DOC_TYPES:
             prompt = DRIVE_USER_PROMPT_TEMPLATE.format(doc_text=doc.to_llm_text())
         else:
             prompt = USER_PROMPT_TEMPLATE.format(repo_name=repo_name, doc_text=doc.to_llm_text())
