@@ -1,7 +1,7 @@
 """
 Streamlit 前端：PMEC 知識庫助理。
 
-登入：Google 帳號（st.login），僅限 ALLOWED_EMAIL_DOMAINS 的公司帳號。
+登入：AUTH_MODE＝google／microsoft（st.login）或 cloudflare（Cloudflare Access）；僅限 ALLOWED_EMAIL_DOMAINS／ALLOWED_EMAILS。
 側邊欄：知識庫筆數；管理員另可看到連線設定、上次同步結果，並觸發同步。
 主畫面：多輪對話聊天介面，回答依問題意圖產生，並附上引用來源。
 權限：只檢索提問者看得到的資料（tenant.toml）；每次提問寫入操作紀錄，回答下方可按「有用／沒幫助」。
@@ -30,30 +30,63 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 # 登入關卡
 # ---------------------------------------------------------------------------
+def _deny(email: str, logout) -> None:
+    st.error(f"帳號 {email} 沒有使用權限，請改用公司帳號登入，或請管理員把你加入允許名單。")
+    if logout is not None and st.button("登出"):
+        logout()
+    st.stop()
+
+
+def _authorize(email, verified, name):
+    return authorize(
+        email=email,
+        email_verified=verified,
+        name=name,
+        allowed_domains=config.ALLOWED_EMAIL_DOMAINS,
+        admin_emails=config.ADMIN_EMAILS,
+        allowed_emails=config.ALLOWED_EMAILS,
+    )
+
+
 def require_login() -> Principal:
     if config.AUTH_DISABLED:
         return Principal(email="dev@localhost", name="本機開發", is_admin=True)
 
-    # 未設定 [auth] 時 st.user 沒有 is_logged_in 屬性，一律視為未登入
+    if config.AUTH_MODE == "cloudflare":
+        from src.cf_access import HEADER, AccessTokenError, verified_email
+
+        try:
+            email = verified_email(
+                st.context.headers.get(HEADER), config.CF_ACCESS_TEAM_DOMAIN, config.CF_ACCESS_AUD
+            )
+        except AccessTokenError as exc:
+            st.title("🧭 PMEC 知識庫助理")
+            st.error(str(exc))
+            st.stop()
+        principal = _authorize(email, True, email)
+        if principal is None:
+            _deny(email, None)
+        return principal
+
+    # google／microsoft：st.login；未設定 [auth] 時 st.user 沒有 is_logged_in 屬性，一律視為未登入
     if not st.user.get("is_logged_in", False):
         st.title("🧭 PMEC 知識庫助理")
-        st.write("請使用公司 Google 帳號登入。")
-        if st.button("使用 Google 帳號登入", type="primary"):
+        label = "Microsoft" if config.AUTH_MODE == "microsoft" else "Google"
+        st.write(f"請使用公司 {label} 帳號登入。")
+        if st.button(f"使用 {label} 帳號登入", type="primary"):
             st.login()
         st.stop()
 
-    principal = authorize(
-        email=st.user.get("email"),
-        email_verified=st.user.get("email_verified"),
-        name=st.user.get("name"),
-        allowed_domains=config.ALLOWED_EMAIL_DOMAINS,
-        admin_emails=config.ADMIN_EMAILS,
-    )
+    if config.AUTH_MODE == "microsoft":
+        # Entra ID 的 ID token 常沒有 email_verified；只有綁定單一租用戶（ENTRA_TENANT_ID）時，
+        # 帳號由該公司管理，才視為已驗證。多租用戶（common／organizations）一律不放行。
+        email = st.user.get("email") or st.user.get("preferred_username")
+        verified = config.ENTRA_TENANT_ID.lower() not in ("", "common", "organizations", "consumers")
+    else:
+        email, verified = st.user.get("email"), st.user.get("email_verified")
+    principal = _authorize(email, verified, st.user.get("name"))
     if principal is None:
-        st.error(f"帳號 {st.user.get('email')} 沒有使用權限，請改用公司 Google 帳號登入。")
-        if st.button("登出"):
-            st.logout()
-        st.stop()
+        _deny(email, st.logout)
     return principal
 
 
@@ -199,7 +232,9 @@ index_store, store_error = try_get_index_store()
 
 with st.sidebar:
     st.markdown(f"👤 **{principal.name}**" + ("（管理員）" if principal.is_admin else ""))
-    if not config.AUTH_DISABLED and st.button("登出", use_container_width=True):
+    if config.AUTH_MODE == "cloudflare":
+        st.link_button("登出", "/cdn-cgi/access/logout", use_container_width=True)
+    elif not config.AUTH_DISABLED and st.button("登出", use_container_width=True):
         st.logout()
 
     if store_error:

@@ -69,6 +69,14 @@ GDRIVE_ENABLED: bool = bool(GDRIVE_FOLDER_IDS)
 # --- 登入（Streamlit st.login + Google OIDC） ---
 ALLOWED_EMAIL_DOMAINS: List[str] = [d.lower() for d in _csv("ALLOWED_EMAIL_DOMAINS")]
 ADMIN_EMAILS: List[str] = [e.lower() for e in _csv("ADMIN_EMAILS")]
+# 個別允許的 email（例如外部顧問的 Gmail），和 ALLOWED_EMAIL_DOMAINS 擇一或並用
+ALLOWED_EMAILS: List[str] = [e.lower() for e in _csv("ALLOWED_EMAILS")]
+# 登入方式：google｜microsoft（st.login＋.streamlit/secrets.toml）｜cloudflare（信任 Cloudflare Access，見 src/cf_access.py）
+AUTH_MODE: str = os.getenv("AUTH_MODE", "google").strip().lower()
+CF_ACCESS_TEAM_DOMAIN: str = os.getenv("CF_ACCESS_TEAM_DOMAIN", "").strip()
+CF_ACCESS_AUD: str = os.getenv("CF_ACCESS_AUD", "").strip()
+# AUTH_MODE=microsoft 時必填：Entra 租用戶 ID（和 secrets.toml 的 server_metadata_url 同一個）
+ENTRA_TENANT_ID: str = os.getenv("ENTRA_TENANT_ID", "").strip()
 # 僅供本機開發略過登入；在 Cloud Run（有 K_SERVICE 環境變數）上一律無效。
 RUNNING_ON_CLOUD_RUN: bool = bool(os.getenv("K_SERVICE"))
 AUTH_DISABLED: bool = (
