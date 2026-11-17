@@ -1,0 +1,93 @@
+# 試用版／地端版：一台機器（辦公室電腦、NAS、VM）跑整套大腦。
+#
+#   python -m src.setup_wizard        # 第一次：回答問題，產生 .env、tenant.toml、.streamlit/secrets.toml
+#   docker compose up -d --build      # 啟動：資料庫 → 升級 schema → 網頁＋背景排程
+#   docker compose --profile tunnel up -d   # 另外接 Cloudflare Tunnel（.env 要有 TUNNEL_TOKEN）
+#   docker compose --profile ollama up -d   # 另外跑地端模型（LLM_PROVIDER=ollama、LLM_BASE_URL=http://ollama:11434/v1）
+#
+# 安全設計：
+# - 網頁只綁在本機 127.0.0.1:8501，對外一律經 Cloudflare Tunnel（只往外連，不開 port）
+# - 網頁用唯讀資料庫角色 pmec_app（只能新增操作紀錄、回饋、同步請求）；寫入只在 scheduler／migrate
+# - 機器重開後 restart: unless-stopped 會自動恢復
+# 密碼與金鑰都在 .env（權限 600，不進 git）。
+
+x-app: &app
+  build: .
+  image: pmec-brain:local
+  env_file: .env
+  volumes:
+    - ./tenant.toml:/app/tenant.toml:ro
+    - ./.streamlit/secrets.toml:/app/.streamlit/secrets.toml:ro
+    - ./secrets:/app/secrets:ro
+  depends_on:
+    db:
+      condition: service_healthy
+
+services:
+  db:
+    image: pgvector/pgvector:0.8.0-pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: pmec
+      POSTGRES_USER: pmec_worker
+      POSTGRES_PASSWORD: ${DB_WORKER_PASSWORD:?請在 .env 設定 DB_WORKER_PASSWORD（安裝精靈會產生）}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pmec_worker -d pmec"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  migrate:
+    <<: *app
+    command: ["python", "-m", "src.worker", "migrate"]
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql+psycopg://pmec_worker:${DB_WORKER_PASSWORD}@db:5432/pmec
+      PMEC_APP_DB_PASSWORD: ${DB_APP_PASSWORD:?請在 .env 設定 DB_APP_PASSWORD（安裝精靈會產生）}
+
+  web:
+    <<: *app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8501}:8080"
+    environment:
+      DATABASE_URL: postgresql+psycopg://pmec_app:${DB_APP_PASSWORD}@db:5432/pmec
+      SYNC_MODE: queue
+      AUTH_DISABLED: "false"   # 對外服務一律要登入，即使 .env 寫了 true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  scheduler:
+    <<: *app
+    command: ["python", "-m", "src.worker", "scheduler"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql+psycopg://pmec_worker:${DB_WORKER_PASSWORD}@db:5432/pmec
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  cloudflared:
+    profiles: ["tunnel"]
+    image: ${CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}
+    restart: unless-stopped
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      # Cloudflare Zero Trust → Networks → Tunnels 建立後取得；公開主機名稱的服務填 http://web:8080
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?--profile tunnel 需要在 .env 設定 TUNNEL_TOKEN}
+    depends_on:
+      - web
+
+  ollama:
+    profiles: ["ollama"]
+    image: ${OLLAMA_IMAGE:-ollama/ollama:latest}
+    restart: unless-stopped
+    volumes:
+      - ollama:/root/.ollama
+
+volumes:
+  pgdata:
+  ollama:

@@ -9,3 +9,4 @@ secrets/
 .dev_db/
 deploy/deploy.env
 tenant.toml
+logs/

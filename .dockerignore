@@ -10,3 +10,4 @@ chroma_data
 *.pyc
 tests
 deploy/deploy.env
+tenant.toml
