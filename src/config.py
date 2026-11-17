@@ -62,6 +62,12 @@ EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "sentence-transformers/parap
 # --- Google Drive（選填：GDRIVE_FOLDER_IDS 有值即啟用） ---
 # 憑證採 Application Default Credentials：Cloud Run 上使用服務掛載的 Service Account；
 # 本機開發以 GOOGLE_APPLICATION_CREDENTIALS 指向金鑰檔，或 `gcloud auth application-default login`。
+# 舊設定 GDRIVE_SERVICE_ACCOUNT_JSON（金鑰檔路徑）：沒有 GOOGLE_APPLICATION_CREDENTIALS 時沿用
+_legacy_sa = os.getenv("GDRIVE_SERVICE_ACCOUNT_JSON", "").strip()
+if _legacy_sa and not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+    _sa_path = Path(_legacy_sa) if Path(_legacy_sa).is_absolute() else PROJECT_ROOT / _legacy_sa
+    if _sa_path.is_file():
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(_sa_path)
 GDRIVE_FOLDER_IDS: List[str] = _csv("GDRIVE_FOLDER_IDS")
 GDRIVE_MAX_FILES: int = int(os.getenv("GDRIVE_MAX_FILES", "100"))
 GDRIVE_ENABLED: bool = bool(GDRIVE_FOLDER_IDS)

@@ -7,7 +7,8 @@
 #
 # 安全設計：
 # - 網頁只綁在本機 127.0.0.1:8501，對外一律經 Cloudflare Tunnel（只往外連，不開 port）
-# - 網頁用唯讀資料庫角色 pmec_app（只能新增操作紀錄、回饋、同步請求）；寫入只在 scheduler／migrate
+# - 網頁用唯讀資料庫角色 pmec_app（只能新增操作紀錄、回饋、同步請求）；寫入只在 scheduler／migrate；
+#   網頁容器裡的 DB_WORKER_PASSWORD、TUNNEL_TOKEN 會被清空
 # - 機器重開後 restart: unless-stopped 會自動恢復
 # 密碼與金鑰都在 .env（權限 600，不進 git）。
 
@@ -56,6 +57,9 @@ services:
       DATABASE_URL: postgresql+psycopg://pmec_app:${DB_APP_PASSWORD}@db:5432/pmec
       SYNC_MODE: queue
       AUTH_DISABLED: "false"   # 對外服務一律要登入，即使 .env 寫了 true
+      # 網頁不需要寫入帳號與 tunnel 憑證：覆蓋掉 env_file 帶進來的值
+      DB_WORKER_PASSWORD: ""
+      TUNNEL_TOKEN: ""
     depends_on:
       migrate:
         condition: service_completed_successfully
