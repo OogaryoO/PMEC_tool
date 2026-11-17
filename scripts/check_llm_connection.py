@@ -1,21 +1,20 @@
 """
-本地手動驗證腳本：確認目前程式碼中「呼叫 RAP LLM」相關的三條路徑
+本地手動驗證腳本：確認目前程式碼中「呼叫 AI 模型」相關的三條路徑
 都真的能打通，而不是只看程式碼邏輯猜測。
 
 執行方式（在專案根目錄，venv 已啟用）：
-    python scripts/check_rap_connection.py
+    python scripts/check_llm_connection.py
 
 會依序做三層驗證，任何一層失敗都會印出完整錯誤訊息並中止：
-    1. 裸連線測試：直接用 openai.OpenAI 打 RAP_BASE_URL，確認
-       RAP_API_KEY / RAP_BASE_URL / RAP_MODEL_NAME 三者組合是正確、
-       有效、且該模型名稱在 RAP 平台上真的存在。
+    1. 連線測試：用 .env 的 LLM_PROVIDER／LLM_MODEL／LLM_API_KEY（或舊的 RAP_*）
+       打一次模型，確認組合正確、模型名稱存在。
     2. Summarizer 路徑：餵一份假造的 ExtractedDocument，跑過
        summarizer.py 的 prompt 組裝 -> 呼叫 LLM -> JSON 解析，確認
        「功能卡片摘要」這條路徑產出的物件欄位正確。
     3. RAGEngine 路徑：用只含這張假卡片的記憶體內檢索來源，跑過 rag_engine.py 的
        組 context -> 呼叫 LLM，確認「PM 問答」這條路徑能產生回答。
 
-不需要連 GitHub，也不會讀寫資料庫。會消耗少量 RAP 額度（三次 LLM 呼叫）。
+不需要連 GitHub，也不會讀寫資料庫。會消耗少量模型額度（三次呼叫）。
 """
 from __future__ import annotations
 
@@ -24,8 +23,6 @@ import traceback
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from openai import OpenAI
 
 from src import config
 from src.documents import ExtractedDocument
@@ -41,29 +38,23 @@ def _fail(step: str, exc: BaseException) -> None:
 
 
 def step1_raw_connection() -> None:
-    print("=== 1/3 裸連線測試 (openai client -> RAP_BASE_URL) ===")
-    print(f"    RAP_BASE_URL   = {config.RAP_BASE_URL}")
-    print(f"    RAP_MODEL_NAME = {config.RAP_MODEL_NAME}")
-    print(f"    RAP_API_KEY    = {config.RAP_API_KEY[:6]}...(len={len(config.RAP_API_KEY)})")
+    from src.llm import LLMClient, LLMError, load_settings, missing_settings
 
-    if not config.RAP_API_KEY or not config.RAP_BASE_URL:
-        _fail("step1", RuntimeError("RAP_API_KEY / RAP_BASE_URL 未設定，請檢查 .env"))
-
-    client = OpenAI(api_key=config.RAP_API_KEY, base_url=config.RAP_BASE_URL, timeout=config.LLM_REQUEST_TIMEOUT)
+    s = load_settings()
+    print("=== 1/3 連線測試（客戶選的 AI 模型） ===")
+    print(f"    LLM_PROVIDER = {s.provider or '（未設定）'}")
+    print(f"    LLM_MODEL    = {s.model or '（未設定）'}")
+    print(f"    LLM_BASE_URL = {s.base_url or '（官方 SDK 預設）'}")
+    print(f"    LLM_API_KEY  = {'已設定' if s.api_key else '未設定'}（len={len(s.api_key)}）")
+    problems = missing_settings(s)
+    if problems:
+        _fail("step1", RuntimeError("；".join(problems)))
     try:
-        resp = client.chat.completions.create(
-            model=config.RAP_MODEL_NAME,
-            messages=[{"role": "user", "content": "請只回覆兩個字：測試成功"}],
-            temperature=0,
-        )
-    except Exception as exc:  # noqa: BLE001
-        _fail("step1 chat.completions.create", exc)
-
-    content = resp.choices[0].message.content if resp.choices else None
-    if not content:
-        _fail("step1", RuntimeError("回應為空 choices/content"))
-    print(f"    模型回覆: {content.strip()!r}")
-    print("[OK] 裸連線測試通過\n")
+        content = LLMClient(s).chat("你是測試助理。", [{"role": "user", "content": "請只回覆兩個字：測試成功"}])
+    except LLMError as exc:
+        _fail("step1 chat", exc)
+    print(f"    模型回覆: {content!r}")
+    print("[OK] 連線測試通過\n")
 
 
 def step2_summarizer() -> None:
@@ -120,7 +111,7 @@ def step3_rag_engine(card) -> None:
     print(f"    檢索到 {len(answer.retrieved)} 張卡片")
     print("    --- markdown ---")
     print("    " + answer.markdown.replace("\n", "\n    "))
-    assert answer.markdown.strip(), "RAP LLM 應回傳非空回答"
+    assert answer.markdown.strip(), "模型應回傳非空回答"
     print("[OK] RAGEngine 路徑通過\n")
 
 
@@ -128,7 +119,7 @@ def main() -> None:
     step1_raw_connection()
     card = step2_summarizer()
     step3_rag_engine(card)
-    print("全部三層驗證皆通過：RAP LLM 呼叫相關程式碼在目前 .env 設定下可正常運作。")
+    print("全部三層驗證皆通過：AI 模型呼叫相關程式碼在目前 .env 設定下可正常運作。")
 
 
 if __name__ == "__main__":

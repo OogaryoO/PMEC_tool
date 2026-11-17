@@ -29,7 +29,7 @@ def db_url():
 def engine(db_url):
     eng = get_engine(db_url)
     with eng.begin() as conn:
-        conn.execute(text("TRUNCATE feature_cards, retrieval_items, index_meta, sync_runs, audit_log, feedback"))
+        conn.execute(text("TRUNCATE feature_cards, retrieval_items, index_meta, sync_runs, audit_log, feedback, sync_requests"))
     yield eng
     eng.dispose()
 

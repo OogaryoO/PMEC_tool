@@ -1,6 +1,6 @@
 """
 RAG 引擎：接收使用者提問（可含先前對話）-> 向量檢索相關的功能卡片與原文段落 -> 呼叫 RAP LLM
-依問題意圖產出回答。
+依問題意圖產出回答。模型由 src/llm.py 決定（客戶自選）。
 
 回答不套用固定範本：由 LLM 先判斷使用者要的是事實查詢、進度狀態、操作說明、
 彙整比較、對客戶承諾評估或閒聊，再決定回答形式；引用資料以 [n] 標註，
@@ -11,10 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
-import openai
-from openai import OpenAI
-
 from src import config
+from src.llm import LLMClient, LLMError
 from src.index_store import IndexStore, IndexStoreError
 
 logger = config.get_logger(__name__)
@@ -105,34 +103,23 @@ class RAGAnswer:
 
 
 class RAGEngine:
-    """組合 IndexStore 檢索與 RAP LLM 生成，依使用者意圖產出知識庫回答。"""
+    """組合 IndexStore 檢索與 LLM 生成，依使用者意圖產出知識庫回答。"""
 
     def __init__(
         self,
         index_store: IndexStore,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        model_name: Optional[str] = None,
+        llm: Optional[LLMClient] = None,
         repo_name: Optional[str] = None,
         top_k: Optional[int] = None,
     ) -> None:
         self.index_store = index_store
         self.repo_name = repo_name or config.GITHUB_REPO or "未指定倉庫"
         self.top_k = top_k or config.RAG_TOP_K
-
-        api_key = api_key or config.RAP_API_KEY
-        base_url = base_url or config.RAP_BASE_URL
-        self.model_name = model_name or config.RAP_MODEL_NAME
-
-        if not api_key:
-            raise RAGEngineError("RAP_API_KEY 未設定，請在 .env 中設定 RAP 平台的 API Key。")
-        if not base_url:
-            raise RAGEngineError("RAP_BASE_URL 未設定，請確認 RAP 端點網址。")
-
         try:
-            self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=config.LLM_REQUEST_TIMEOUT)
-        except Exception as exc:  # noqa: BLE001
-            raise RAGEngineError(f"初始化 RAP LLM 客戶端失敗：{exc}") from exc
+            self._llm = llm or LLMClient()
+        except LLMError as exc:
+            raise RAGEngineError(str(exc)) from exc
+        self.model_label = self._llm.label
 
         self._system_prompt = SYSTEM_PROMPT_TEMPLATE.format(repo_name=self.repo_name)
 
@@ -195,27 +182,12 @@ class RAGEngine:
         return "\n".join(blocks)
 
     def _call_llm(self, messages: List[dict]) -> str:
+        system = messages[0]["content"] if messages and messages[0]["role"] == "system" else ""
+        rest = messages[1:] if system else messages
         try:
-            response = self._client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                temperature=config.LLM_TEMPERATURE,
-            )
-        except openai.AuthenticationError as exc:
-            raise RAGEngineError("RAP API Key 驗證失敗，請確認 RAP_API_KEY 是否正確、是否已過期。") from exc
-        except openai.APIConnectionError as exc:
-            raise RAGEngineError(f"無法連線至 RAP 端點，請確認網路狀況與端點網址是否正確：{exc}") from exc
-        except openai.RateLimitError as exc:
-            raise RAGEngineError("RAP LLM 已達速率限制，請稍後再試。") from exc
-        except openai.APIStatusError as exc:
-            raise RAGEngineError(f"RAP LLM 回應錯誤 (status={exc.status_code})：{exc.message}") from exc
-        except Exception as exc:  # noqa: BLE001
-            raise RAGEngineError(f"呼叫 RAP LLM 時發生未預期錯誤：{exc}") from exc
-
-        if not response.choices or not response.choices[0].message.content:
-            raise RAGEngineError("RAP LLM 回應為空，請稍後再試。")
-
-        return response.choices[0].message.content.strip()
+            return self._llm.chat(system, rest)
+        except LLMError as exc:
+            raise RAGEngineError(str(exc)) from exc
 
     # ------------------------------------------------------------------
     def answer(

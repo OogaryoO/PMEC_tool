@@ -7,6 +7,7 @@
     python -m src.worker report [--days 7]   # 印出使用週報（提問數、有用比例、找不到資料的問題）
     python -m src.worker purge-audit         # 刪除超過 tenant.toml audit.retention_days 的操作紀錄
     python -m src.worker check-tenant        # 檢查 tenant.toml，印出連接器、權限規則與階段
+    python -m src.worker scheduler           # 常駐：處理網頁的同步請求＋每日同步（不在 Google Cloud 上時用）
 
 失敗時以非零狀態碼結束，讓 Cloud Run Job 標記為失敗。
 """
@@ -25,7 +26,8 @@ logger = config.get_logger("src.worker")
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m src.worker")
-    parser.add_argument("command", choices=["migrate", "sync", "reembed", "report", "purge-audit", "check-tenant"])
+    parser.add_argument("command", choices=["migrate", "sync", "reembed", "report", "purge-audit", "check-tenant", "scheduler"])
+    parser.add_argument("--trigger", default="", help="sync 記錄在 sync_runs 的觸發來源")
     parser.add_argument("--days", type=int, default=7, help="report 的統計天數")
     args = parser.parse_args(argv)
 
@@ -60,13 +62,24 @@ def main(argv=None) -> int:
         from src.sync_pipeline import run_recorded_sync
 
         # Cloud Run Job 執行時帶有 CLOUD_RUN_EXECUTION；由排程或網頁觸發皆屬此類
-        trigger = "job:" + os.getenv("CLOUD_RUN_EXECUTION", "manual")
+        from src.sync_pipeline import SyncAlreadyRunning
+
+        trigger = args.trigger or "job:" + os.getenv("CLOUD_RUN_EXECUTION", "manual")
         try:
             result = run_recorded_sync(engine, index_store, trigger=trigger)
+        except SyncAlreadyRunning as exc:
+            logger.info("%s", exc)
+            return 0
         except Exception:  # noqa: BLE001 - 錯誤已記錄在 sync_runs，這裡只決定結束碼
             logger.exception("同步失敗。")
             return 1
         logger.info("同步完成：%s", result)
+        return 0
+
+    if args.command == "scheduler":
+        from src.scheduler import run_forever
+
+        run_forever(engine, index_store)
         return 0
 
     if args.command == "report":

@@ -1,5 +1,5 @@
 """
-呼叫 RAP LLM（相容 OpenAI SDK）將原始的 README / API 規格 / PR / Google Drive 文件
+呼叫客戶選的 LLM（src/llm.py）將原始的 README / API 規格 / PR / Google Drive 文件
 轉譯為 PM 看得懂的「功能卡片」：
 
     - 功能名稱 (feature_name)
@@ -15,10 +15,8 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
-import openai
-from openai import OpenAI
-
 from src import config
+from src.llm import LLMClient, LLMError
 from src.chunker import source_ref_of
 from src.documents import ExtractedDocument
 
@@ -26,7 +24,7 @@ logger = config.get_logger(__name__)
 
 
 class SummarizerError(Exception):
-    """呼叫 RAP LLM 或解析回應失敗時拋出，訊息需可直接呈現給使用者。"""
+    """呼叫 LLM 或解析回應失敗時拋出，訊息需可直接呈現給使用者。"""
 
 
 SYSTEM_PROMPT = (
@@ -127,65 +125,20 @@ class FeatureCard:
 
 
 class Summarizer:
-    """封裝與 RAP LLM 的互動，將 ExtractedDocument 轉為 FeatureCard。"""
+    """封裝與 LLM 的互動，將 ExtractedDocument 轉為 FeatureCard。"""
 
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        base_url: Optional[str] = None,
-        model_name: Optional[str] = None,
-    ) -> None:
-        self.api_key = api_key or config.RAP_API_KEY
-        self.base_url = base_url or config.RAP_BASE_URL
-        self.model_name = model_name or config.RAP_MODEL_NAME
-
-        if not self.api_key:
-            raise SummarizerError("RAP_API_KEY 未設定，請在 .env 中設定 RAP 平台的 API Key。")
-        if not self.base_url:
-            raise SummarizerError("RAP_BASE_URL 未設定，請確認 RAP 端點網址。")
-
+    def __init__(self, llm: Optional[LLMClient] = None) -> None:
         try:
-            self._client = OpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url,
-                timeout=config.LLM_REQUEST_TIMEOUT,
-            )
-        except Exception as exc:  # noqa: BLE001
-            raise SummarizerError(f"初始化 RAP LLM 客戶端失敗：{exc}") from exc
+            self._llm = llm or LLMClient()
+        except LLMError as exc:
+            raise SummarizerError(str(exc)) from exc
 
     # ------------------------------------------------------------------
     def _call_llm(self, user_prompt: str) -> str:
         try:
-            response = self._client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=config.LLM_TEMPERATURE,
-            )
-        except openai.AuthenticationError as exc:
-            raise SummarizerError(
-                "RAP API Key 驗證失敗，請確認 RAP_API_KEY 是否正確、是否已過期。"
-            ) from exc
-        except openai.APIConnectionError as exc:
-            raise SummarizerError(
-                f"無法連線至 RAP 端點 ({self.base_url})，請確認網路狀況與端點網址是否正確。"
-            ) from exc
-        except openai.RateLimitError as exc:
-            raise SummarizerError("RAP LLM 已達速率限制，請稍後再試。") from exc
-        except openai.APIStatusError as exc:
-            raise SummarizerError(f"RAP LLM 回應錯誤 (status={exc.status_code})：{exc.message}") from exc
-        except Exception as exc:  # noqa: BLE001
-            raise SummarizerError(f"呼叫 RAP LLM 時發生未預期錯誤：{exc}") from exc
-
-        if not response.choices:
-            raise SummarizerError("RAP LLM 回應為空，請稍後再試。")
-
-        content = response.choices[0].message.content
-        if not content:
-            raise SummarizerError("RAP LLM 回應內容為空，請稍後再試。")
-        return content
+            return self._llm.chat(SYSTEM_PROMPT, [{"role": "user", "content": user_prompt}])
+        except LLMError as exc:
+            raise SummarizerError(str(exc)) from exc
 
     @staticmethod
     def _parse_json_response(raw_text: str) -> Dict:
@@ -204,9 +157,9 @@ class Summarizer:
             try:
                 return json.loads(match.group(0))
             except json.JSONDecodeError as exc:
-                raise SummarizerError(f"無法解析 RAP LLM 回傳的 JSON：{exc}\n原始回應：{raw_text[:500]}") from exc
+                raise SummarizerError(f"無法解析 LLM 回傳的 JSON：{exc}\n原始回應：{raw_text[:500]}") from exc
 
-        raise SummarizerError(f"RAP LLM 回應非預期格式（找不到 JSON）：{raw_text[:500]}")
+        raise SummarizerError(f"LLM 回應非預期格式（找不到 JSON）：{raw_text[:500]}")
 
     def summarize_document(self, doc: ExtractedDocument, repo_name: str) -> FeatureCard:
         """將單一 ExtractedDocument 轉為 FeatureCard。"""
@@ -266,6 +219,6 @@ class Summarizer:
                     progress_callback(idx, total, doc)
 
         if docs and not any(card for _, card in results):
-            raise SummarizerError("所有文件摘要皆失敗，請檢查 RAP 連線設定與模型名稱是否正確。")
+            raise SummarizerError("所有文件摘要皆失敗，請檢查 AI 模型設定（LLM_PROVIDER／LLM_MODEL／LLM_API_KEY）。")
 
         return results

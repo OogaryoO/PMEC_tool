@@ -206,10 +206,36 @@ def run_sync(
     )
 
 
+# pg_advisory_lock 的鍵：同一個資料庫同一時間只跑一個同步（排程、網頁請求、手動指令都適用）
+SYNC_LOCK_KEY = 72_7274_01
+
+
+class SyncAlreadyRunning(Exception):
+    """已有其他同步在進行中。"""
+
+
 def run_recorded_sync(
     engine: Engine, index_store: IndexStore, trigger: str, progress: Optional[ProgressFn] = None
 ) -> SyncResult:
-    """執行同步並把開始、結果或錯誤記錄到 sync_runs；例外照常往外拋。"""
+    """執行同步並把開始、結果或錯誤記錄到 sync_runs；例外照常往外拋。
+    同一個資料庫同時只允許一個同步，已有同步在跑時拋出 SyncAlreadyRunning。"""
+    lock_conn = engine.connect()
+    try:
+        if not lock_conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": SYNC_LOCK_KEY}).scalar_one():
+            raise SyncAlreadyRunning("已有同步正在進行，請等它完成。")
+        lock_conn.commit()
+        return _run_recorded_sync_locked(engine, index_store, trigger, progress)
+    finally:
+        try:
+            lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": SYNC_LOCK_KEY})
+            lock_conn.commit()
+        finally:
+            lock_conn.close()
+
+
+def _run_recorded_sync_locked(
+    engine: Engine, index_store: IndexStore, trigger: str, progress: Optional[ProgressFn] = None
+) -> SyncResult:
     with engine.begin() as conn:
         run_id = conn.execute(
             text("INSERT INTO sync_runs (trigger, status) VALUES (:t, 'running') RETURNING id"), {"t": trigger}
@@ -232,6 +258,29 @@ def run_recorded_sync(
             {"s": json.dumps(asdict(result)), "id": run_id},
         )
     return result
+
+
+def request_sync(engine: Engine, requested_by: str) -> None:
+    """網頁按「同步」：只新增一筆請求，由背景排程執行（網頁角色沒有寫入知識庫的權限）。"""
+    with engine.begin() as conn:
+        conn.execute(text("INSERT INTO sync_requests (requested_by) VALUES (:u)"), {"u": requested_by})
+
+
+def pending_sync_requests(engine: Engine) -> int:
+    with engine.connect() as conn:
+        return conn.execute(text("SELECT count(*) FROM sync_requests WHERE picked_at IS NULL")).scalar_one()
+
+
+def take_sync_requests(engine: Engine) -> list:
+    """取出所有待處理請求（標記 picked_at），回傳請求者清單；沒有則回傳空清單。"""
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                "UPDATE sync_requests SET picked_at = now() WHERE picked_at IS NULL "
+                "RETURNING requested_by"
+            )
+        ).scalars().all()
+    return list(rows)
 
 
 def last_sync_run(engine: Engine) -> Optional[dict]:

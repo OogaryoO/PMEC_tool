@@ -70,3 +70,8 @@ def ensure_app_role(engine: Engine, password: str) -> None:
         if has_audit:
             conn.execute(text(f"GRANT INSERT ON audit_log, feedback TO {APP_ROLE}"))
             conn.execute(text(f"GRANT USAGE ON SEQUENCE audit_log_id_seq, feedback_id_seq TO {APP_ROLE}"))
+        # 例外：網頁的「同步」按鈕只新增同步請求，由背景排程執行（src/scheduler.py）
+        has_requests = conn.execute(text("SELECT to_regclass('public.sync_requests') IS NOT NULL")).scalar_one()
+        if has_requests:
+            conn.execute(text(f"GRANT INSERT ON sync_requests TO {APP_ROLE}"))
+            conn.execute(text(f"GRANT USAGE ON SEQUENCE sync_requests_id_seq TO {APP_ROLE}"))

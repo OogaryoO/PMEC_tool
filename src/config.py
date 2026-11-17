@@ -45,10 +45,8 @@ def _csv(name: str) -> List[str]:
 # 環境變數
 # ---------------------------------------------------------------------------
 
-# --- RAP (國網 RAP 平台，相容 OpenAI SDK) ---
-RAP_API_KEY: str = os.getenv("RAP_API_KEY", "")
-RAP_BASE_URL: str = os.getenv("RAP_BASE_URL", "https://portal.genai.nchc.org.tw/api/v1")
-RAP_MODEL_NAME: str = os.getenv("RAP_MODEL_NAME", "Llama-3.3-70B-Instruct")
+# --- AI 模型：見 src/llm.py（LLM_PROVIDER／LLM_API_KEY／LLM_MODEL／LLM_BASE_URL）。
+# 舊設定 RAP_API_KEY／RAP_BASE_URL／RAP_MODEL_NAME 仍可用（視為 LLM_PROVIDER=rap）。
 
 # --- GitHub ---
 GITHUB_TOKEN: str = os.getenv("GITHUB_TOKEN", "")
@@ -81,11 +79,15 @@ AUTH_DISABLED: bool = (
 GCP_PROJECT: str = os.getenv("GCP_PROJECT", "")
 GCP_REGION: str = os.getenv("GCP_REGION", "asia-east1")
 SYNC_JOB_NAME: str = os.getenv("SYNC_JOB_NAME", "")
+# 網頁「同步」按鈕怎麼執行：
+#   cloudrun＝觸發 Cloud Run Job（有 SYNC_JOB_NAME 時的預設）
+#   queue   ＝新增一筆請求，由 `python -m src.worker scheduler` 執行（Docker／自有主機用；網頁不需要寫入權限）
+#   inline  ＝在網頁程序內直接同步（只適合單機開發；沒有其他設定時的預設）
+SYNC_MODE: str = (os.getenv("SYNC_MODE") or ("cloudrun" if SYNC_JOB_NAME else "inline")).strip().lower()
 
 # --- 其他可調參數 ---
 PR_FETCH_LIMIT: int = int(os.getenv("PR_FETCH_LIMIT", "20"))
 RAG_TOP_K: int = int(os.getenv("RAG_TOP_K", "8"))
-LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.2"))
 LLM_REQUEST_TIMEOUT: float = float(os.getenv("LLM_REQUEST_TIMEOUT", "60"))
 
 
@@ -110,13 +112,10 @@ def validate(
         if not GITHUB_REPO or "/" not in GITHUB_REPO:
             missing.append("GITHUB_REPO 未設定或格式錯誤：需為 `owner/repo` 格式，例如 `my-org/my-service`。")
 
-    if require_rap:
-        if not RAP_API_KEY:
-            missing.append("RAP_API_KEY 未設定：請向國網 RAP 平台申請 API Key。")
-        if not RAP_BASE_URL:
-            missing.append("RAP_BASE_URL 未設定：請確認 RAP 端點網址。")
-        if not RAP_MODEL_NAME:
-            missing.append("RAP_MODEL_NAME 未設定：請確認要使用的模型名稱。")
+    if require_rap:  # 參數名沿用舊版；檢查的是客戶選的 AI 模型
+        from src.llm import missing_settings
+
+        missing.extend(missing_settings())
 
     if require_gdrive and not GDRIVE_FOLDER_IDS:
         missing.append(

@@ -98,7 +98,17 @@ if "messages" not in st.session_state:
 # 同步（僅管理員）
 # ---------------------------------------------------------------------------
 def start_sync(index_store: IndexStore) -> None:
-    if config.SYNC_JOB_NAME:
+    if config.SYNC_MODE == "queue":
+        from src.sync_pipeline import request_sync
+
+        try:
+            request_sync(get_engine(), principal.email)
+            st.success("已送出同步請求，背景排程約 1 分鐘內開始；完成後重新整理頁面即可看到結果。")
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"送出同步請求失敗（資料庫是否已執行 migrate？背景排程有沒有在跑？）：{exc}")
+        return
+
+    if config.SYNC_MODE == "cloudrun":
         from src.jobs import JobTriggerError, trigger_sync_job
 
         try:
@@ -133,7 +143,9 @@ def render_admin_panel(index_store) -> None:
         st.markdown("**資料來源**：" + "、".join(c.describe() for c in build_connectors(tenant.connectors)))
     except ConnectorError as exc:
         missing.append(str(exc))
-    st.markdown(f"**RAP 模型**：`{config.RAP_MODEL_NAME or '（未設定）'}`")
+    from src.llm import load_settings
+
+    st.markdown(f"**AI 模型**：`{load_settings().label}`")
 
     for m in missing:
         st.caption(f"⚠️ {m}")
@@ -159,6 +171,15 @@ def render_admin_panel(index_store) -> None:
                 )
             if run["error"]:
                 st.caption(f"⚠️ {run['error']}")
+        if config.SYNC_MODE == "queue":
+            from src.sync_pipeline import pending_sync_requests
+
+            try:
+                waiting = pending_sync_requests(get_engine())
+                if waiting:
+                    st.caption(f"⏳ 有 {waiting} 筆同步請求等待背景排程處理。")
+            except Exception:  # noqa: BLE001 - 舊資料庫沒有 sync_requests 表
+                pass
 
     if st.button("🔄 同步並更新知識庫", use_container_width=True, disabled=bool(missing or index_store is None)):
         start_sync(index_store)
